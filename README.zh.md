@@ -60,7 +60,7 @@ opencode 启动时会自动安装 npm 插件。
 
 ```bash
 mkdir -p .opencode
-curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main/src/index.ts \
+curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/v0.1.0/src/index.ts \
   -o .opencode/vision-analyze.ts
 ```
 
@@ -75,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main
 
 curl 方式说明：
 
-- 建议固定到发布 tag 而非 `main`，如 `.../opencode-vision-analyze/v0.1.0/src/index.ts`；升级即重新 curl。
+- 上方 URL 固定到发布 tag `v0.1.0` 以保证稳定；升级即改用更新 tag 或 `main` 重新 curl。
 - 文件是 TypeScript 源码——opencode 用 Bun 加载插件，直接可用。
 - 选项必须通过 `plugin` 元组传入（`.opencode/plugins/` 自动发现目录无法携带选项）。
 

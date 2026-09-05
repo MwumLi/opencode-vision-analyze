@@ -58,7 +58,7 @@ The plugin is a single self-contained TypeScript file with zero runtime dependen
 
 ```bash
 mkdir -p .opencode
-curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main/src/index.ts \
+curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/v0.1.0/src/index.ts \
   -o .opencode/vision-analyze.ts
 ```
 
@@ -73,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main
 
 Notes for the curl path:
 
-- Pin a release tag instead of `main` for stability, e.g. `.../opencode-vision-analyze/v0.1.0/src/index.ts`. Upgrading = re-run curl.
+- The URL above pins release tag `v0.1.0` for stability; upgrading = re-run curl against the newer tag or `main`.
 - The file is TypeScript source — opencode loads plugins with Bun, so this works as-is.
 - Options must be passed via the `plugin` tuple (the auto-discovered `.opencode/plugins/` directory can't carry options).
 
