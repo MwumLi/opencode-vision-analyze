@@ -1,0 +1,53 @@
+{
+  "name": "opencode-vision-analyze",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: vision_analyze tool — describe images & image URLs with your own vision model for text-only main models; native-image fast path for multimodal models. Zero runtime dependencies.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "bun test",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "vision",
+    "vision-model",
+    "image",
+    "multimodal",
+    "plugin"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MwumLi/opencode-vision-analyze.git"
+  },
+  "homepage": "https://github.com/MwumLi/opencode-vision-analyze#readme",
+  "bugs": {
+    "url": "https://github.com/MwumLi/opencode-vision-analyze/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.16.2",
+    "@opencode-ai/sdk": "^1.16.2",
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  }
+}
