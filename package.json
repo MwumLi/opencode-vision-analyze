@@ -1,6 +1,6 @@
 {
   "name": "opencode-vision-analyze",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0",
   "description": "OpenCode plugin: vision_analyze tool — describe images & image URLs with your own vision model for text-only main models; native-image fast path for multimodal models. Zero runtime dependencies.",
   "type": "module",
   "main": "./dist/index.js",
