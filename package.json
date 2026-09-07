@@ -18,7 +18,9 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "test": "bun test",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "preversion": "bun run typecheck && bun test && bun run build",
+    "postversion": "git push --follow-tags"
   },
   "keywords": [
     "opencode",

@@ -144,6 +144,31 @@ bun run build       # tsc → dist/
 
 The unit tests stub the plugin input/client — no running opencode instance is required.
 
+## Release
+
+Versioning is driven entirely by `npm version` — no manual `package.json` edits. It updates the version, creates a commit and an annotated `v<version>` tag, and (via hooks) runs a local gate then pushes to trigger the GitHub release workflow that publishes to npm.
+
+```bash
+npm version patch                      # 0.1.x → 0.1.(x+1): commit + tag v0.1.x, auto-push → release
+npm version 1.2.0                      # explicit full version
+npm version prerelease --preid beta    # beta smoke: 0.1.1 → 0.1.2-beta.0
+```
+
+Hooks configured in `package.json`:
+
+- `preversion` — runs `typecheck && test && build` locally; if any fails the version is not bumped or tagged.
+- `postversion` — `git push --follow-tags`; pushes the commit and its tag, which triggers the GitHub Actions `release.yml` (`on.push.tags: ["v*"]`) that runs the checks again and `npm publish --access public` using the `NPM_TOKEN` secret.
+
+Beta smoke → stable flow:
+
+```bash
+npm version prerelease --preid beta   # publish a beta to npm
+# verify the beta on npm, then:
+npm version patch                      # drops the pre-release and bumps to the stable version
+```
+
+Escape hatches: `npm version 1.2.3 --no-git-tag-version` (only bump the file) or `--ignore-scripts` (skip all hooks). `npm version` requires a clean working tree. If the `postversion` push fails, run `git push --follow-tags` manually.
+
 ## License
 
 [MIT](./LICENSE)

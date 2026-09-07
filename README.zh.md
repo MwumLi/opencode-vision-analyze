@@ -146,6 +146,31 @@ bun run build       # tsc → dist/
 
 单元测试使用 stub 的插件输入/client——不需要运行中的 opencode。
 
+## 发布
+
+版本变更完全由 `npm version` 驱动——无需手改 `package.json`。它会更新版本号、创建 commit 与 annotated `v<版本>` tag，并通过钩子先跑本地门禁再自动推送，触发 GitHub release workflow 发布到 npm。
+
+```bash
+npm version patch                      # 0.1.x → 0.1.(x+1)：commit + tag v0.1.x，自动推送 → 发布
+npm version 1.2.0                      # 显式指定完整版本
+npm version prerelease --preid beta    # beta 冒烟：0.1.1 → 0.1.2-beta.0
+```
+
+`package.json` 中配置的钩子：
+
+- `preversion` —— 本地执行 `typecheck && test && build`；任一失败则不 bump / 不打 tag。
+- `postversion` —— `git push --follow-tags`；推送 commit 及其 tag，触发 GitHub Actions `release.yml`（`on.push.tags: ["v*"]`），先复跑全部检查再用 `NPM_TOKEN` secret 执行 `npm publish --access public`。
+
+beta 冒烟 → 正式两段式：
+
+```bash
+npm version prerelease --preid beta   # 先发一个 beta 到 npm
+# 在 npm 上验证 beta 无误后：
+npm version patch                      # 去掉 pre 段并升到正式版本
+```
+
+逃逸舱：`npm version 1.2.3 --no-git-tag-version`（只改版本文件）或 `--ignore-scripts`（跳过全部钩子）。`npm version` 要求工作区干净；若 `postversion` 推送失败，手动执行 `git push --follow-tags`。
+
 ## 许可证
 
 [MIT](./LICENSE)
