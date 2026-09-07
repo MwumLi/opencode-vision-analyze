@@ -7,8 +7,9 @@
  * URL 下载与错误路径 / 超时 / 永不抛错 / dispose 清理。
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test"
-import { access, mkdir, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, writeFile, readdir } from "node:fs/promises"
 import path from "node:path"
+import { homedir, tmpdir } from "node:os"
 import type { PluginOptions, ToolContext, ToolResult } from "@opencode-ai/plugin"
 import {
   TINY_PNG,
@@ -30,6 +31,7 @@ import {
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
+import { isInsideGitRepo, resolveVisionDir } from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
 let dir: string
@@ -894,5 +896,121 @@ describe("超时 / 中止 / 容错", () => {
     controller.abort()
     const result = await pending
     expect(result.output).toContain("Image analysis failed: Aborted")
+  })
+})
+
+describe("图片存储分域（git / 用户级）", () => {
+  /** 临时非 git 目录（不带 .git），用于触发「非 git → 用户级缓存」路径。 */
+  async function makeNoGitDir(prefix = "vision-no-git-"): Promise<string> {
+    const noGit = await mkdtemp(path.join(tmpdir(), prefix))
+    // 祖先（系统 tmpdir）不是 git repo；保险起见显式断言不含 .git
+    expect(isInsideGitRepo(noGit)).toBe(false)
+    return noGit
+  }
+
+  test("isInsideGitRepo：目录含 .git 目录 → true", async () => {
+    expect(isInsideGitRepo(dir)).toBe(true)
+  })
+
+  test("isInsideGitRepo：子目录向上命中父级 .git → true", async () => {
+    const sub = path.join(dir, "a", "b")
+    await mkdir(sub, { recursive: true })
+    expect(isInsideGitRepo(sub)).toBe(true)
+  })
+
+  test("isInsideGitRepo：.git 为文件（worktree）→ true", async () => {
+    const noGit = await makeNoGitDir()
+    try {
+      await writeFile(path.join(noGit, ".git"), "gitdir: /elsewhere/.git/worktrees/wt\n")
+      expect(isInsideGitRepo(noGit)).toBe(true)
+    } finally {
+      await removeDir(noGit)
+    }
+  })
+
+  test("isInsideGitRepo：无 .git 的目录（到根目录为止）→ false", async () => {
+    const noGit = await makeNoGitDir()
+    try {
+      expect(isInsideGitRepo(noGit)).toBe(false)
+      expect(isInsideGitRepo(path.parse(noGit).root)).toBe(false) // 根目录边界不抛错
+    } finally {
+      await removeDir(noGit)
+    }
+  })
+
+  test("resolveVisionDir：git 项目 → 项目内 .opencode/vision", async () => {
+    expect(resolveVisionDir(dir, process.env, process.platform, homedir())).toBe(
+      path.join(dir, ".opencode", "vision"),
+    )
+  })
+
+  test("resolveVisionDir：非 git → 三平台用户缓存目录（含 env 覆盖）", async () => {
+    const noGit = await makeNoGitDir()
+    try {
+      // Linux 默认：~/.cache
+      expect(resolveVisionDir(noGit, {}, "linux", "/home/u")).toBe(
+        path.join("/home/u", ".cache", "opencode-vision-analyze", "vision"),
+      )
+      // Linux + XDG_CACHE_HOME 覆盖
+      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "/x/cache" }, "linux", "/home/u")).toBe(
+        path.join("/x/cache", "opencode-vision-analyze", "vision"),
+      )
+      // macOS：~/Library/Caches
+      expect(resolveVisionDir(noGit, {}, "darwin", "/Users/u")).toBe(
+        path.join("/Users/u", "Library", "Caches", "opencode-vision-analyze", "vision"),
+      )
+      // Windows：%LOCALAPPDATA% 覆盖
+      expect(resolveVisionDir(noGit, { LOCALAPPDATA: "C:\\lapp" }, "win32", "C:\\Users\\u")).toBe(
+        path.join("C:\\lapp", "opencode-vision-analyze", "vision"),
+      )
+    } finally {
+      await removeDir(noGit)
+    }
+  })
+
+  test("端到端：非 git 目录贴图 → 落在用户级缓存目录，hint 指向该处", async () => {
+    const noGit = await makeNoGitDir("vision-no-git-e2e-")
+    const cacheRoot = await mkdtemp(path.join(tmpdir(), "vision-cache-"))
+    const prev = process.env.XDG_CACHE_HOME
+    process.env.XDG_CACHE_HOME = cacheRoot
+    try {
+      const client = makeStubClient()
+      const input = makePluginInput(noGit, client)
+      const mod = (await import("../src/index")).default
+      const hooks = await mod.server(input, { models: ["test/vision-model"] })
+      const out = chatOutput([imagePart()])
+      await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+
+      const hint = out.parts[out.parts.length - 1] as { text?: string }
+      expect(hint.text).toContain("vision_analyze")
+      const match = /image_path: ([^\]]+)/.exec(hint.text ?? "")
+      expect(match?.[1]).toBe(path.join(cacheRoot, "opencode-vision-analyze", "vision", `${TINY_PNG_SHA}.png`))
+      expect(await fileExists(match?.[1] ?? "")).toBe(true)
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CACHE_HOME
+      else process.env.XDG_CACHE_HOME = prev
+      await removeDir(noGit)
+      await removeDir(cacheRoot)
+    }
+  })
+
+  test("并发写同一 sha：最终文件字节完整、无残留临时文件", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+
+    const images = [imagePart(), imagePart()] // 同字节同 sha
+    const outA = chatOutput([images[0]])
+    const outB = chatOutput([images[1]])
+    const hook = hooks["chat.message"]
+    await Promise.all([
+      hook(chatInput({ sessionID: "ses_a", model: MAIN_MODEL }), outA),
+      hook(chatInput({ sessionID: "ses_b", model: MAIN_MODEL }), outB),
+    ])
+
+    const target = path.join(dir, ".opencode", "vision", `${TINY_PNG_SHA}.png`)
+    const bytes = await import("node:fs/promises").then((m) => m.readFile(target))
+    expect(bytes.equals(TINY_PNG)).toBe(true)
+    const files = await readdir(path.dirname(target))
+    expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
   })
 })

@@ -2,10 +2,10 @@
  * opencode-vision-analyze
  *
  * 为「不具备视觉能力的主模型」提供图片解读路由：当用户在消息中附带图片时，
- * 插件把图片落盘到 .opencode/vision/<sha256>.<ext>，并向模型注入一条
- * synthetic 提示（TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具
- * 让指定的视觉模型描述图片。若主模型本身支持图片输入，则不做任何干预，
- * 原图直接发给主模型。
+ * 插件把图片落盘到 vision 目录（git 项目内 → <项目>/.opencode/vision；
+ * 非 git 目录 → 用户级缓存目录），并向模型注入一条 synthetic 提示
+ * （TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具让指定的视觉
+ * 模型描述图片。若主模型本身支持图片输入，则不做任何干预，原图直接发给主模型。
  *
  * 安装方式一（npm）：
  *   {
@@ -53,7 +53,9 @@
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
  */
 import { createHash, randomUUID } from "node:crypto"
+import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
+import { homedir } from "node:os"
 import path from "node:path"
 import type { FilePart, TextPart } from "@opencode-ai/sdk"
 import type { Hooks, Plugin, PluginInput, PluginOptions, ToolContext, ToolResult } from "@opencode-ai/plugin"
@@ -90,6 +92,51 @@ const VISION_SYSTEM_PROMPT = [
 
 /** data URL 形如 data:<mime>;base64,<payload> */
 const DATA_URL_PATTERN = /^data:([^;]+);base64,(.+)$/
+
+/**
+ * 判断目录是否位于 git 项目内：从 dir 向上（含自身）逐级找 `.git`
+ * （目录，或 worktree/submodule 的 `.git` 指针文件），到文件系统根为止。
+ * 纯同步、纯内置模块；作为命名导出便于单元测试注入真实临时目录验证。
+ */
+export function isInsideGitRepo(dir: string): boolean {
+  let cur = path.resolve(dir)
+  for (;;) {
+    if (existsSync(path.join(cur, ".git"))) return true
+    const parent = path.dirname(cur)
+    if (parent === cur) return false // 已到文件系统根
+    cur = parent
+  }
+}
+
+/** 用户级（非 git）图片缓存的平台根：cache 目录 + opencode-vision-analyze/vision。 */
+export function userVisionCacheRoot(
+  env: Record<string, string | undefined>,
+  platform: string,
+  home: string,
+): string {
+  const base =
+    platform === "darwin"
+      ? (env.XDG_CACHE_HOME ?? path.join(home, "Library", "Caches"))
+      : platform === "win32"
+        ? (env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"))
+        : (env.XDG_CACHE_HOME ?? path.join(home, ".cache"))
+  return path.join(base, "opencode-vision-analyze", "vision")
+}
+
+/**
+ * 图片存储根：与 opencode 的项目/全局语义对齐——
+ * git 项目内 → <项目>/.opencode/vision（现状）；非 git 目录 → 用户级缓存目录。
+ * 解析一次即可（纯函数，入参可注入以便三平台与 env 覆盖的单测）。
+ */
+export function resolveVisionDir(
+  inputDir: string,
+  env: Record<string, string | undefined>,
+  platform: string,
+  home: string,
+): string {
+  if (isInsideGitRepo(inputDir)) return path.join(inputDir, ".opencode", "vision")
+  return userVisionCacheRoot(env, platform, home)
+}
 
 /**
  * http(s) 下载图片的大小上限（20 MB）。提示注入可让模型指向超大图片，
@@ -141,6 +188,10 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   const timeoutOption = optionsArg?.timeout_ms
   const timeoutMs =
     typeof timeoutOption === "number" && Number.isFinite(timeoutOption) && timeoutOption > 0 ? timeoutOption : 60000
+
+  // 图片存储根：解析一次（git 项目 → 项目 .opencode/vision；非 git → 用户级缓存）。
+  // 下载与贴图落盘共用，见 resolveVisionDir 模块级注释。
+  const visionDir = resolveVisionDir(input.directory, process.env, process.platform, homedir())
 
   // ---- 闭包状态 ----------------------------------------------------------
   /** sessionID → 该会话最近一次 prompt 的模型（prompt 未显式指定 model 时回退使用） */
@@ -315,10 +366,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         return { error: "image exceeds 20 MB download limit" }
       }
       const sha = createHash("sha256").update(bytes).digest("hex")
-      const dir = path.join(input.directory, ".opencode", "vision")
-      await fs.mkdir(dir, { recursive: true })
-      const filepath = path.join(dir, `${sha}${ext}`)
-      await fs.writeFile(filepath, bytes)
+      // 共享目录（用户级/多实例）下并发写同一 sha：先写临时文件再 rename，内容寻址下原子幂等。
+      await fs.mkdir(visionDir, { recursive: true, mode: 0o700 })
+      const filepath = path.join(visionDir, `${sha}${ext}`)
+      const tmpPath = path.join(visionDir, `${sha}${ext}.tmp-${randomUUID()}`)
+      await fs.writeFile(tmpPath, bytes)
+      await fs.rename(tmpPath, filepath)
       return { filepath }
     } catch (error) {
       return { error: errText(error) }
@@ -492,7 +545,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   }
 
   /**
-   * 把一个图片 file part 落盘到 <directory>/.opencode/vision/<sha256>.<ext>。
+   * 把一个图片 file part 落盘到 <visionDir>/<sha256>.<ext>（visionDir 见 resolveVisionDir）。
    * 文件名用内容哈希，天然去重（同一张图多次发送只落一份）。
    * 返回落盘信息；MIME 不受支持或 URL 不是 base64 data URL 时返回 undefined。
    */
@@ -504,10 +557,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     try {
       const bytes = Buffer.from(match[2], "base64")
       const sha = createHash("sha256").update(bytes).digest("hex")
-      const dir = path.join(input.directory, ".opencode", "vision")
-      await fs.mkdir(dir, { recursive: true })
-      const filepath = path.join(dir, `${sha}${ext}`)
-      await fs.writeFile(filepath, bytes)
+      // 与下载路径一致：先写临时文件再 rename，保证并发写同一 sha 时最终文件完整。
+      await fs.mkdir(visionDir, { recursive: true, mode: 0o700 })
+      const filepath = path.join(visionDir, `${sha}${ext}`)
+      const tmpPath = path.join(visionDir, `${sha}${ext}.tmp-${randomUUID()}`)
+      await fs.writeFile(tmpPath, bytes)
+      await fs.rename(tmpPath, filepath)
       return { filepath }
     } catch {
       // fail-open 原则：图片落盘失败（EACCES/ENOSPC 等）只是少了 vision_analyze
