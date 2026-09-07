@@ -35,10 +35,40 @@ export const OTHER_VISION_MODEL = modelRef("test", "other-vision") // 有视觉�
 /** /config/providers 返回的模型能力描述。 */
 type StubModel = { capabilities: { input: { image: boolean } } }
 
+/** provider.source 取值：决定自动发现的档位（config > env/api > custom）。 */
+export type StubSource = "config" | "env" | "api" | "custom"
+
+/** /config/providers 返回的单个 provider 描述（带 source 供档位排序）。 */
+export type StubProvider = { id: string; source: StubSource; models: Record<string, StubModel | undefined> }
+
 export type StubProvidersResult = {
-  data?: { providers?: Array<{ id: string; models: Record<string, StubModel | undefined> }> }
+  data?: { providers?: StubProvider[] }
   error?: unknown
 }
+
+/**
+ * 便捷构造单个 provider stub：models 只需给「modelID → 是否支持图片」，
+ * 由本函数补全成 { id, source, models: { <modelID>: { capabilities: { input: { image } } } } }。
+ */
+export const providerStub = (
+  id: string,
+  source: StubSource,
+  models: Record<string, { image: boolean }>,
+): StubProvider => ({
+  id,
+  source,
+  models: Object.fromEntries(
+    Object.entries(models).map(([modelID, { image }]) => [
+      modelID,
+      { capabilities: { input: { image } } },
+    ]),
+  ),
+})
+
+/** 由多个 provider stub 拼成 config.providers() 的返回体。 */
+export const providersStub = (...providers: StubProvider[]): StubProvidersResult => ({
+  data: { providers },
+})
 
 /** session.* 调用记录（断言子会话生命周期时使用）。 */
 export type SessionCalls = {
@@ -65,6 +95,8 @@ export function makeStubClient(input?: { providersResult?: StubProvidersResult }
         providers: [
           {
             id: "test",
+            // 默认单 provider 归属 config 源（自动发现时最优先）
+            source: "config",
             models: {
               "text-model": { capabilities: { input: { image: false } } },
               "vision-model": { capabilities: { input: { image: true } } },
@@ -74,7 +106,7 @@ export function makeStubClient(input?: { providersResult?: StubProvidersResult }
         ],
       },
     }
-  let promptBehavior: () => Promise<unknown> = async () => ({
+  let promptBehavior: (model?: { providerID: string; modelID: string }) => Promise<unknown> = async () => ({
     data: { parts: [{ type: "text", text: "a red square" }] },
   })
   return {
@@ -83,8 +115,8 @@ export function makeStubClient(input?: { providersResult?: StubProvidersResult }
     setProvidersResult: (next: StubProvidersResult | (() => Promise<StubProvidersResult>)) => {
       providersResult = next
     },
-    /** 注入 session.prompt 行为（如永不 resolve、报错等）。 */
-    setPromptBehavior: (behavior: () => Promise<unknown>) => {
+    /** 注入 session.prompt 行为（如永不 resolve、报错等）；可选收 model 以区分候选。 */
+    setPromptBehavior: (behavior: (model?: { providerID: string; modelID: string }) => Promise<unknown>) => {
       promptBehavior = behavior
     },
     config: {
@@ -102,7 +134,8 @@ export function makeStubClient(input?: { providersResult?: StubProvidersResult }
       prompt: async (args: { path: { id: string }; body: Record<string, unknown> }) => {
         const body = args.body as { model?: { providerID: string; modelID: string }; parts: unknown[] }
         calls.prompt.push({ id: args.path.id, model: body.model, parts: body.parts })
-        return promptBehavior()
+        // 把当前尝试的 model 传给 behavior，便于按候选断言顺序/结果
+        return promptBehavior(body.model)
       },
       delete: async (args: { path: { id: string } }) => {
         calls.deleted.push(args.path.id)
