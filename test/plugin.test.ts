@@ -28,6 +28,7 @@ import {
   providerStub,
   providersStub,
   type LoadedPlugin,
+  type StubProvidersResult,
 } from "./helpers"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
@@ -504,6 +505,196 @@ describe("自动发现排序（Provider.source 档序）", () => {
     expect(result.output).toContain("described by opencode/mimo-free")
     expect(client.calls.prompt[0]?.model).toEqual({ providerID: "opencode", modelID: "mimo-free" })
     expect(client.calls.prompt.length).toBe(1)
+  })
+})
+
+describe("unlisted_fallback 续接", () => {
+  /** 显式 test/vision-model（config 源）+ 未列出的 free/mimo-free（custom 源）image-capable 并存。 */
+  function clientWithUnlisted() {
+    const client = makeStubClient()
+    client.setProvidersResult(
+      providersStub(
+        providerStub("test", "config", { "vision-model": { image: true }, "text-model": { image: false } }),
+        providerStub("free", "custom", { "mimo-free": { image: true } }),
+      ),
+    )
+    return client
+  }
+
+  test("正向：unlisted_fallback=true，显式 A 失败 → 续试未列出的 mimo-free 成功", async () => {
+    const client = clientWithUnlisted()
+    client.setPromptBehavior((model) =>
+      model?.providerID === "test"
+        ? { error: new Error("boom for vision") }
+        : { data: { parts: [{ type: "text", text: "a red square" }] } },
+    )
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model"],
+      unlisted_fallback: true,
+    } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // 显式 A 失败后沿链续试到未列出的 custom 源模型 → 标签标注实际产出者
+    expect(result.output).toContain("described by free/mimo-free")
+    expect(result.output).toContain("a red square")
+    expect(client.calls.prompt.map((p) => p.model)).toEqual([
+      { providerID: "test", modelID: "vision-model" },
+      { providerID: "free", modelID: "mimo-free" },
+    ])
+  })
+
+  test("反向：unlisted_fallback=false（默认），同场景只试显式 A，不续试未列出模型", async () => {
+    const client = clientWithUnlisted()
+    client.setPromptBehavior(() => ({ error: new Error("boom for vision") }))
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model"],
+    } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    expect(result.output).toContain("Image analysis failed: all 1 candidate model(s) failed")
+    expect(result.output).not.toContain("mimo-free")
+    expect(client.calls.prompt.length).toBe(1)
+    expect(client.calls.prompt[0]?.model).toEqual({ providerID: "test", modelID: "vision-model" })
+  })
+
+  test("退化：unlisted_fallback=true 但 inventory 无 image-capable → 链退化为纯显式 [A]", async () => {
+    const client = makeStubClient()
+    client.setProvidersResult(
+      providersStub(
+        providerStub("test", "config", { "vision-model": { image: true }, "text-model": { image: false } }),
+        providerStub("free", "custom", { "mimo-free": { image: false } }),
+      ),
+    )
+    client.setPromptBehavior(() => ({ error: new Error("boom for vision") }))
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model"],
+      unlisted_fallback: true,
+    } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // fallback 追加部分为空 → 链 = 纯显式 [A]，A 失败即全败（不续试无 image 能力的模型）
+    expect(result.output).toContain("Image analysis failed: all 1 candidate model(s) failed")
+    expect(result.output).not.toContain("mimo-free")
+    expect(client.calls.prompt.length).toBe(1)
+    expect(client.calls.prompt[0]?.model).toEqual({ providerID: "test", modelID: "vision-model" })
+  })
+})
+
+describe("source 档位缺口（config/env/custom 与未知归档）", () => {
+  /** config 源 a/ca、env 源 b/eb、custom 源 c/cc 三个 image-capable 模型并存（无显式配置）。 */
+  function threeTierClient() {
+    const client = makeStubClient()
+    client.setProvidersResult(
+      providersStub(
+        providerStub("a", "config", { ca: { image: true } }),
+        providerStub("b", "env", { eb: { image: true } }),
+        providerStub("c", "custom", { cc: { image: true } }),
+      ),
+    )
+    return client
+  }
+
+  test("档位推进：config 源 ca 失败 → 沿链续试 env 源 eb 成功", async () => {
+    const client = threeTierClient()
+    client.setPromptBehavior((model) =>
+      model?.providerID === "a"
+        ? { error: new Error("ca down") }
+        : { data: { parts: [{ type: "text", text: "a red square" }] } },
+    )
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // 默认档序 config > env > custom：config 失败后不跳过 env 档直接续试成功，成功即止
+    expect(result.output).toContain("described by b/eb")
+    expect(client.calls.prompt.map((p) => p.model)).toEqual([
+      { providerID: "a", modelID: "ca" },
+      { providerID: "b", modelID: "eb" },
+    ])
+  })
+
+  test("free_first：档序反转后首候选为 custom 源 c/cc", async () => {
+    const client = threeTierClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { free_first: true } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // free_first=true → custom 源（免费优先）升到档首，成功即止
+    expect(result.output).toContain("described by c/cc")
+    expect(client.calls.prompt[0]?.model).toEqual({ providerID: "c", modelID: "cc" })
+    expect(client.calls.prompt.length).toBe(1)
+  })
+
+  test("未知/缺失 source 归档3：排在 config/env 之后（最后一档）且可被续试", async () => {
+    const client = makeStubClient()
+    // providerStub 的 source 类型不含「缺失 / 任意字符串」，此处手写 providers 对象：
+    // config 源 a/ca、env 源 b/eb 在高档；u1 缺 source、u2 带未知 "other" → 均归档最末档。
+    client.setProvidersResult({
+      data: {
+        providers: [
+          { id: "a", source: "config", models: { ca: { capabilities: { input: { image: true } } } } },
+          { id: "b", source: "env", models: { eb: { capabilities: { input: { image: true } } } } },
+          { id: "u1", models: { om: { capabilities: { input: { image: true } } } } },
+          { id: "u2", source: "other", models: { ot: { capabilities: { input: { image: true } } } } },
+        ],
+      },
+    } as unknown as StubProvidersResult)
+    client.setPromptBehavior((model) =>
+      model?.providerID === "a" || model?.providerID === "b" || model?.providerID === "u1"
+        ? { error: new Error(`${model?.providerID} down`) }
+        : { data: { parts: [{ type: "text", text: "a red square" }] } },
+    )
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "x" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // config/env 先于未知档被尝试；高档全失败后沿链续试到未知 source 模型成功
+    expect(result.output).toContain("described by u2/ot")
+    expect(client.calls.prompt.map((p) => p.model)).toEqual([
+      { providerID: "a", modelID: "ca" },
+      { providerID: "b", modelID: "eb" },
+      { providerID: "u1", modelID: "om" },
+      { providerID: "u2", modelID: "ot" },
+    ])
   })
 })
 

@@ -459,8 +459,9 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * 枚举 config.providers() 中全部 image-capable 模型，并按 Provider.source 档位
    * 稳定排序（档内保持 providers 返回顺序）：默认 config > env/api > custom；
    * free_first=true 时档序反转（custom 优先）。顺带预填 imageCapable 缓存
-   * （与 imageSupport 同源，避免后续重复请求）。providers 查询瞬时失败返回空数组：
-   * 显式链仍可用（fallback 追加部分静默跳过），自动模式退化为空链。
+   * （与 imageSupport 同源，避免后续重复请求）。providers 查询瞬时失败返回空数组
+   * 并记日志：显式链仍可用（fallback 追加部分静默跳过），自动模式退化为空链——
+   * 因 resolveChain 的 memoize，本次空链会持续整个进程（见 docs/DESIGN.md 已知限制）。
    */
   const listImageCapableModels = async (): Promise<Array<{ providerID: string; modelID: string }>> => {
     try {
@@ -470,7 +471,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       for (const provider of result.data.providers ?? []) {
         const tier = tierOfSource(provider.source)
         for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-          if (model.capabilities?.input?.image !== true) continue
+          if (model?.capabilities?.input?.image !== true) continue
           imageCapable.set(`${provider.id}/${modelID}`, true)
           found.push({ providerID: provider.id, modelID, tier })
         }
@@ -478,7 +479,10 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       // 稳定排序：默认按档位升序（config 优先）；free_first 反转成降序（custom 优先）
       found.sort((a, b) => (freeFirst ? b.tier - a.tier : a.tier - b.tier))
       return found.map(({ providerID, modelID }) => ({ providerID, modelID }))
-    } catch {
+    } catch (error) {
+      // 自动发现的关键 providers 查询失败要可观测：不静默吞掉，记一行日志便于定位。
+      // 显式链不受影响；自动模式按空链处理（本次进程内不再重试，见已知限制）。
+      console.error("[opencode-vision-analyze] config.providers() failed; auto vision discovery disabled", error)
       return []
     }
   }
