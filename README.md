@@ -15,7 +15,7 @@ There are already a few vision plugins in the ecosystem. The differences:
 | | opencode-vision | opencode-vision-router | opencode-image-vision | **opencode-vision-analyze** |
 |---|---|---|---|---|
 | Mechanism | skill + subagent delegation | pointer + subagent delegation | direct SDK call (read-image / read-ocr) | **tool + plugin-managed sub-session** |
-| Vision model source | auto-discovered image models | single `model` option | per-feature provider/model | single `model` option |
+| Vision model source | auto-discovered image models | single `model` option | per-feature provider/model | ordered `models` candidate chain + auto-discovery |
 | Main-model capability detection | models.dev catalog + auth | `chat.params` live learning | name regex (fragile) | `config.providers()` capabilities (cached) |
 | Image persistence | /tmp (session+part hash) | tmpDir | user dir / clipboard dir | `.opencode/vision/` content-addressed sha256 |
 | Output | subagent answers itself | subagent answers itself | description / OCR text | description text (with cache) |
@@ -85,7 +85,7 @@ Notes for the curl path:
 | `models` | no | — | Ordered candidate list of vision models (`provider/model`), tried one after another until one succeeds. Mutually exclusive with `model`. |
 | `unlisted_fallback` | no | `false` | When an explicit `model`/`models` chain is configured and it is exhausted, keep going with image-capable models that were not listed. |
 | `free_first` | no | `false` | In auto-discovery, prefer anonymous/built-in free providers (`custom` source) ahead of config-defined ones — reverses the source-tier order. |
-| `timeout_ms` | no | `60000` | Timeout (ms) budget per single candidate attempt (worst-case total is N × `timeout_ms`) |
+| `timeout_ms` | no | `60000` | Timeout (ms) budget for each individual `create`/`prompt` request inside the vision sub-session |
 
 An ordered-candidates example with auto-fallback and free-first discovery:
 

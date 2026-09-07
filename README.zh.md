@@ -17,7 +17,7 @@
 | | opencode-vision | opencode-vision-router | opencode-image-vision | **opencode-vision-analyze** |
 |---|---|---|---|---|
 | 机制 | skill + 子代理委托 | 指针 + 子代理委托 | 直连 SDK（read-image / read-ocr） | **工具 + 插件自管子会话** |
-| 视觉模型来源 | 自动发现的视觉模型 | 单一 `model` 选项 | 每功能独立 provider/model | 单一 `model` 选项 |
+| 视觉模型来源 | 自动发现的视觉模型 | 单一 `model` 选项 | 每功能独立 provider/model | 有序 `models` 候选链 + 自动发现 |
 | 主模型能力判定 | models.dev 目录 + auth | `chat.params` 实时学习 | 名字正则（脆弱） | `config.providers()` 能力查询（缓存） |
 | 图片落盘 | /tmp（会话+part 哈希） | tmpDir | 用户目录 / 剪贴板目录 | `.opencode/vision/` 内容寻址 sha256 |
 | 产出 | 子代理自行作答 | 子代理自行作答 | 描述 / OCR 文本 | 描述文本（带缓存） |
@@ -87,7 +87,7 @@ curl 方式说明：
 | `models` | 否 | — | 有序候选视觉模型数组（`provider/model`），逐个尝试直到成功即止。与 `model` 互斥。 |
 | `unlisted_fallback` | 否 | `false` | 显式 `model`/`models` 链耗尽后，自动续试未列入清单的 image-capable 模型。 |
 | `free_first` | 否 | `false` | 自动发现时优先匿名/内置免费（`custom` 源）provider，置于 config 源之前——反转 source 档序。 |
-| `timeout_ms` | 否 | `60000` | 单候选尝试的超时预算（毫秒）；总最坏耗时 = N × `timeout_ms` |
+| `timeout_ms` | 否 | `60000` | 子会话内每次 create/prompt 请求各自的超时预算（毫秒） |
 
 有序候选 + 自动续接 + 免费优先的配置示例：
 

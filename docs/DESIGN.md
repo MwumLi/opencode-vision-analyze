@@ -90,6 +90,7 @@ vision_analyze 工具：
 - **孤儿回合计费**：超时/中止后子会话被删除，但 provider 端已发出的请求不取消；可在删除前调用 `/session/{id}/abort` 改善
 - **描述缓存无上限**：进程级 Map，按 (图, 问题) 对数增长
 - **dispose 非确定性**：孤儿清理为尽力而为，无确定性测试覆盖
+- **自动发现失败不重试**：`config.providers()` 查询失败会使进程内自动链为空（`resolveChain` 的 memoize 把空结果留在进程内，之后不再重试），显式链不受影响；仅记一行 `console.error` 日志可观测
 
 ## Roadmap
 
