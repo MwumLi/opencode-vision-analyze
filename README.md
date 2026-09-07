@@ -133,7 +133,6 @@ Key behaviors:
 
 ## Roadmap
 
-- [ ] `model: undefined` fallback for first messages without an explicit model
 - [ ] Timeout wrapping for the capability query (`config.providers()`)
 - [ ] Abort sub-session (`/session/{id}/abort`) before delete on timeout
 - [ ] LRU / size cap for the description cache

@@ -135,7 +135,6 @@ vision_analyze 工具：
 
 ## Roadmap
 
-- [ ] `model` 未显式指定时对首条消息的回退处理
 - [ ] 能力查询（`config.providers()`）加超时保护
 - [ ] 超时路径先中止子会话（`/session/{id}/abort`）再删除
 - [ ] 描述缓存 LRU / 容量上限
