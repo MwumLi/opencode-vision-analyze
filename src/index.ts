@@ -9,19 +9,26 @@
  *
  * 安装方式一（npm）：
  *   {
- *     "plugin": [["opencode-vision-analyze", { "model": "provider/vision-model" }]]
+ *     "plugin": [["opencode-vision-analyze", { "models": ["provider/vision-model"] }]]
  *   }
  *
  * 安装方式二（curl 下载单文件，免 npm）：
  *   mkdir -p .opencode
  *   curl -fsSL <raw-url>/src/index.ts -o .opencode/vision-analyze.ts
  *   {
- *     "plugin": [["./.opencode/vision-analyze.ts", { "model": "provider/vision-model" }]]
+ *     "plugin": [["./.opencode/vision-analyze.ts", { "models": ["provider/vision-model"] }]]
  *   }
  *
  * 选项：
- *   - model（必填）：视觉模型的 "provider/model" 标识，例如 "anthropic/claude-sonnet-4-5"
- *   - timeout_ms：子会话请求的超时毫秒数（正数，默认 60000）
+ *   - models（可选，缺省/空数组 = 自动模式）：有序视觉候选数组，如
+ *     ["provider-a/m1", "provider-b/m2"]；单模型写 ["provider/model"] 即可
+ *   - unlisted_fallback（可选，默认 false）：显式候选耗尽后自动续接未列出的 image-capable 模型
+ *   - free_first（可选，默认 false）：自动发现档序反转（custom/匿名免费源优先，默认 config 优先）
+ *   - timeout_ms：单候选子会话请求的超时毫秒数（正数，默认 60000）
+ *
+ * 候选链语义：显式 models 恒在链首；缺省/空数组 → 自动发现全部 image-capable
+ * 模型并按 Provider.source 档序排列。链上候选逐个尝试，成功即止，全败聚合报错。
+ * 描述子会话的模型属于候选链，chat.message 递归防护以整链成员为集。
  *
  * 工作方式（vision_analyze 工具路径）：主模型调用 vision_analyze 时，插件
  * 创建一个 parentID 挂在当前会话下的临时子会话（不进会话列表、不生成
@@ -99,15 +106,36 @@ const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
  */
 const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): Promise<Hooks> => {
   // ---- 选项解析与校验 ----------------------------------------------------
-  const model = optionsArg?.model
-  if (typeof model !== "string" || !model.includes("/")) {
-    throw new Error(
-      `opencode-vision-analyze requires a "model" option in "provider/model" format, got: ${JSON.stringify(model)}`,
-    )
+  // 归一化规则：models 是唯一显式入口 —— 有序候选数组（保序去重，重复只留首个）。
+  // 缺省或空数组 → explicit 为空（进入自动发现，见 resolveChain）。传了 models 但
+  // 类型不对（非字符串数组）直接抛错，避免用户配错被静默当成自动模式。
+  const modelsOption = optionsArg?.models
+  if (optionsArg?.models !== undefined && !Array.isArray(modelsOption)) {
+    throw new Error('opencode-vision-analyze option "models" must be an array of "provider/model" strings')
   }
-  const separator = model.indexOf("/")
-  const visionProviderID = model.slice(0, separator)
-  const visionModelID = model.slice(separator + 1)
+  const hasModels = Array.isArray(modelsOption) && modelsOption.length > 0
+  // 收集字符串候选并逐项校验 provider/model 格式（modelID 允许含 "/"，按首个 "/" 切分）。
+  // 逐项 throw：元素非法报 label "models[i]"；保序去重（重复只留首个）。
+  const raw = hasModels ? (modelsOption as string[]) : []
+  const explicitModels: Array<{ providerID: string; modelID: string }> = []
+  const seenKeys = new Set<string>()
+  raw.forEach((item, index) => {
+    const label = `models[${index}]`
+    if (typeof item !== "string" || !item.includes("/")) {
+      throw new Error(
+        `opencode-vision-analyze option "${label}" must be in "provider/model" format, got: ${JSON.stringify(item)}`,
+      )
+    }
+    const sep = item.indexOf("/")
+    if (seenKeys.has(item)) return // 重复模型只保留首个
+    seenKeys.add(item)
+    explicitModels.push({ providerID: item.slice(0, sep), modelID: item.slice(sep + 1) })
+  })
+  // unlisted_fallback：显式链耗尽后是否自动续接未列出的 image-capable 模型（仅显式配置时
+  // 生效）。free_first：自动发现档序是否反转（匿名/内置 custom 优先，默认 config 优先）。
+  // 二者按严格布尔取真，非布尔值宽容忽略按 false 处理（与下方 timeout_ms 的宽容校验一致）。
+  const fallbackUnlisted = optionsArg?.unlisted_fallback === true
+  const freeFirst = optionsArg?.free_first === true
 
   // 子会话请求的超时时间：timeout_ms 为正数时生效，默认 60 秒。
   const timeoutOption = optionsArg?.timeout_ms
@@ -119,8 +147,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   const sessionModels = new Map<string, { providerID: string; modelID: string }>()
   /** "provider/model" → 是否具备图片输入能力（查询结果缓存，进程级） */
   const imageCapable = new Map<string, boolean>()
-  /** 描述缓存："<sha>:<question>" → 描述文本（同一张图 + 同一个问题只描述一次） */
-  const descriptions = new Map<string, string>()
+  /**
+   * 描述缓存："<sha>:<question>" → 描述结果（同一张图 + 同一个问题只描述一次）。
+   * 值带 modelId：记录实际产出该描述的候选模型，缓存命中时标签沿用入库模型，
+   * 而不是用当前候选链链首近似（链配置变化或 fallback 命中次选时标签才真实）。
+   */
+  const descriptions = new Map<string, { modelId: string; text: string }>()
   /** 本插件创建的子会话 ID 集合（正常路径用后即删，dispose 兜底清理残留） */
   const subSessions = new Set<string>()
 
@@ -155,17 +187,22 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     })
   }
 
+  /** 判断错误是否为中止信号（AbortError），供 attemptModel 标记 / 链循环中止整链。 */
+  const isAbortError = (error: unknown): boolean => error instanceof Error && error.name === "AbortError"
+
   /**
-   * 创建临时子会话（parentID 挂在当前会话下，不进会话列表、不生成标题），
-   * 让视觉模型描述一张图片并返回描述文本。
-   * 任何失败（会话创建 / 请求 / 超时 / abort / 无文本）都返回 { ok: false, error }。
-   * 无论成败，finally 中都会删除子会话——用后即删，不留孤儿。
+   * 单个候选的尝试：创建子会话（parentID 挂当前会话）→ 用该候选模型描述 →
+   * 删除子会话。任何失败（创建 / 请求 / 超时 / 中止 / 底层抛错 / 无文本）都
+   * 收敛为 { ok: false } 返回而不向上抛——推进与否交给 describeWithChain 的
+   * 链循环决策；中止额外打 aborted 标记，链循环据此立即停整链。无论成败，
+   * finally 中都删除子会话——用后即删，不留孤儿。
    */
-  const describeImage = async (
+  const attemptModel = async (
+    candidate: { providerID: string; modelID: string },
     image: { bytes: Buffer; mime: string },
     question: string,
     ctx: ToolContext,
-  ): Promise<{ ok: true; text: string } | { ok: false; error: string }> => {
+  ): Promise<{ ok: true; text: string } | { ok: false; error: string; aborted?: boolean }> => {
     const dataURL = `data:${image.mime};base64,${image.bytes.toString("base64")}`
     let subID: string | undefined
     try {
@@ -182,7 +219,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         input.client.session.prompt({
           path: { id: subID },
           body: {
-            model: { providerID: visionProviderID, modelID: visionModelID },
+            model: { providerID: candidate.providerID, modelID: candidate.modelID },
             agent: "build",
             // 子会话禁用全部工具：视觉模型只做纯文本描述，避免它反过来调用
             // vision_analyze 形成递归，也避免任何副作用。
@@ -205,6 +242,9 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         .trim()
       if (!text) return { ok: false, error: "vision model returned no text" }
       return { ok: true, text }
+    } catch (error) {
+      // 异常（超时 / 中止 / 底层抛错）同样收敛为失败结果；aborted 标记交由链循环判断
+      return { ok: false, error: errText(error), aborted: isAbortError(error) }
     } finally {
       if (subID) {
         subSessions.delete(subID)
@@ -212,6 +252,41 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       }
     }
   }
+
+  /**
+   * 候选链描述：沿 resolveChain() 产出的候选链逐个尝试，首个成功即返回（附带
+   * 成功候选的引用键作标签来源）；单个候选失败记录 `${key}: ${error}` 并推进
+   * 下一个；收到 abort（pre-abort 短路或尝试结果的 aborted 标记）立即中止整链；
+   * 全部失败聚合各候选原因；空链返回友好错误。本函数永不抛错。
+   */
+  const describeWithChain = async (
+    image: { bytes: Buffer; mime: string },
+    question: string,
+    ctx: ToolContext,
+  ): Promise<{ ok: true; text: string; modelId: string } | { ok: false; error: string }> => {
+    // pre-abort 短路：不解析候选链、不建子会话，直接以 Aborted 收尾
+    if (ctx.abort.aborted) return { ok: false, error: "Aborted" }
+    const chain = await resolveChain()
+    const failures: string[] = []
+    for (const candidate of chain) {
+      const attempt = await attemptModel(candidate, image, question, ctx)
+      if (attempt.ok) return { ok: true, text: attempt.text, modelId: modelRefKey(candidate) }
+      if (attempt.aborted) return { ok: false, error: attempt.error } // abort 中止整链
+      failures.push(`${modelRefKey(candidate)}: ${attempt.error}`)
+    }
+    if (failures.length === 0) {
+      return {
+        ok: false,
+        error:
+          "no image-capable model configured (set the plugin models option or configure an image-capable provider model)",
+      }
+    }
+    return { ok: false, error: `all ${failures.length} candidate model(s) failed: ${failures.join("; ")}` }
+  }
+
+  /** 描述标签：标注图片文件名与产出描述的模型引用键（basename 运行时按图传入）。 */
+  const format = (basename: string, modelId: string, text: string): string =>
+    `[Image: ${basename} — described by ${modelId}]\n${text}`
 
   /**
    * 下载 http(s) URL 指向的图片并落盘到 <visionDir>/<sha256><ext>：
@@ -307,15 +382,19 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
 
       // 描述缓存：内容哈希 + 问题作为 key，命中直接复用（title 标注 cached）。
       const key = `${createHash("sha256").update(image.bytes).digest("hex")}:${question}`
-      const format = (text: string) =>
-        `[Image: ${path.basename(imagePath)} — described by ${visionProviderID}/${visionModelID}]\n${text}`
       const cached = descriptions.get(key)
-      if (cached !== undefined) return { title: `${title} (cached)`, output: format(cached) }
+      if (cached !== undefined) {
+        // 命中时标签沿用入库时的模型（cached.modelId）：即便此刻候选链链首
+        // 已与入库模型不同，也保持标签真实、不重写。
+        return { title: `${title} (cached)`, output: format(path.basename(imagePath), cached.modelId, cached.text) }
+      }
 
-      const result = await describeImage(image, question, ctx)
+      const result = await describeWithChain(image, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
-      descriptions.set(key, result.text)
-      return { title, output: format(result.text) }
+      // 入库带上实际产出描述的候选 modelId，供后续缓存命中还原真实标签
+      descriptions.set(key, { modelId: result.modelId, text: result.text })
+      // 成功标签直接用实际产出描述的候选引用键（而非链首近似）
+      return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
     } catch (error) {
       return { title, output: `Image analysis failed: ${errText(error)}` }
     }
@@ -344,6 +423,72 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     } catch {
       return false
     }
+  }
+
+  /** Provider.source → 自动发现档位：config 最优先，env/api 次之，custom 与未知值最末 */
+  const tierOfSource = (source: string): number =>
+    source === "config" ? 0 : source === "env" || source === "api" ? 1 : 2
+
+  /** "provider/model" 引用键（与 imageCapable 缓存的键格式一致） */
+  const modelRefKey = (c: { providerID: string; modelID: string }): string => `${c.providerID}/${c.modelID}`
+
+  // 候选链 memoize：chat.message 钩子与 vision_analyze 工具共享一次 providers 查询
+  let chainPromise: Promise<Array<{ providerID: string; modelID: string }>> | undefined
+  /**
+   * 归一化产出最终候选链（统一数组，运行时只做逐个尝试）：
+   * - 显式非空：显式链恒在链首（不受 free_first/档序影响）；
+   *   unlisted_fallback=true 时再追加未列出的 image-capable 模型
+   * - 显式为空：整链 = 自动发现（全部 image-capable 模型，按 source 档序）
+   */
+  const resolveChain = (): Promise<Array<{ providerID: string; modelID: string }>> => {
+    chainPromise ??= (async () => {
+      // 自动模式：整链由自动发现决定
+      if (explicitModels.length === 0) return listImageCapableModels()
+      // 显式模式：默认只用显式链；unlisted_fallback=true 时追加 inventory 中未列出的模型
+      if (!fallbackUnlisted) return explicitModels
+      const inventory = await listImageCapableModels()
+      const explicitSet = new Set(explicitModels.map(modelRefKey))
+      return [...explicitModels, ...inventory.filter((c) => !explicitSet.has(modelRefKey(c)))]
+    })()
+    return chainPromise
+  }
+
+  /**
+   * 枚举 config.providers() 中全部 image-capable 模型，并按 Provider.source 档位
+   * 稳定排序（档内保持 providers 返回顺序）：默认 config > env/api > custom；
+   * free_first=true 时档序反转（custom 优先）。顺带预填 imageCapable 缓存
+   * （与 imageSupport 同源，避免后续重复请求）。providers 查询瞬时失败返回空数组
+   * 并记日志：显式链仍可用（fallback 追加部分静默跳过），自动模式退化为空链——
+   * 因 resolveChain 的 memoize，本次空链会持续整个进程（见 docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md 已知限制）。
+   */
+  const listImageCapableModels = async (): Promise<Array<{ providerID: string; modelID: string }>> => {
+    try {
+      const result = await input.client.config.providers()
+      if (!result.data) return []
+      const found: Array<{ providerID: string; modelID: string; tier: number }> = []
+      for (const provider of result.data.providers ?? []) {
+        const tier = tierOfSource(provider.source)
+        for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+          if (model?.capabilities?.input?.image !== true) continue
+          imageCapable.set(`${provider.id}/${modelID}`, true)
+          found.push({ providerID: provider.id, modelID, tier })
+        }
+      }
+      // 稳定排序：默认按档位升序（config 优先）；free_first 反转成降序（custom 优先）
+      found.sort((a, b) => (freeFirst ? b.tier - a.tier : a.tier - b.tier))
+      return found.map(({ providerID, modelID }) => ({ providerID, modelID }))
+    } catch (error) {
+      // 自动发现的关键 providers 查询失败要可观测：不静默吞掉，记一行日志便于定位。
+      // 显式链不受影响；自动模式按空链处理（本次进程内不再重试，见已知限制）。
+      console.error("[opencode-vision-analyze] config.providers() failed; auto vision discovery disabled", error)
+      return []
+    }
+  }
+
+  /** 判断某 model 是否为当前候选链成员（chat.message 递归防护用） */
+  const isCandidateModel = async (model: { providerID: string; modelID: string }): Promise<boolean> => {
+    const chain = await resolveChain()
+    return chain.some((c) => c.providerID === model.providerID && c.modelID === model.modelID)
   }
 
   /**
@@ -376,11 +521,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * push 进去的 part 会一并入库）。
    *
    * 职责：
-   * 1. 递归防护——视觉模型自身的消息（例如子会话）不做任何处理；
-   * 2. 记录会话当前模型；
-   * 3. 收集图片 part，没有图片则直接返回；
+   * 1. 记录会话当前模型（先于递归防护：会话模型恰为视觉模型时也需记录）；
+   * 2. 收集图片 part，没有图片则直接返回；
+   * 3. 递归防护——消息模型 ∈ 候选链全体成员（我们的描述子会话）则放行；
    * 4. 能力门控——主模型本身能看图则不注入提示；
-   * 5. 图片落盘，并注入一条 synthetic text part 引导模型使用 vision_analyze。
+   * 5. 空链降级——没有任何可用视觉模型时不注入 hint；
+   * 6. 图片落盘，并注入一条 synthetic text part 引导模型使用 vision_analyze。
    */
   const onChatMessage: NonNullable<Hooks["chat.message"]> = async (hookInput, output) => {
     // 记录会话当前模型，供后续 vision_analyze 快速路径与未显式指定 model 的
@@ -389,19 +535,25 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     // 看不到该模型，会退化为子会话描述。
     if (hookInput.model) sessionModels.set(hookInput.sessionID, hookInput.model)
 
-    // 递归防护：视觉模型自身的 prompt（描述子会话）直接放行，
-    // 避免插件处理自己发起的消息造成循环。
-    if (hookInput.model?.providerID === visionProviderID && hookInput.model?.modelID === visionModelID) return
-
     // 只处理 base64 图片附件；没有图片就没有副作用。
     const images = output.parts.filter(
       (part): part is FilePart => part.type === "file" && part.mime.startsWith("image/"),
     )
     if (images.length === 0) return
 
+    // 递归防护：防护集 = 整条候选链（而非单模型/链首）。描述子会话用的模型是
+    // 链上任意候选，只要消息模型命中任一成员就放行，避免插件处理自己发起的
+    // 消息形成循环。resolveChain 懒加载 + memoize，只在首次触发一次 providers 查询。
+    if (hookInput.model && (await isCandidateModel(hookInput.model))) return
+
     // 能力门控：主模型有视觉能力时原图直发，不需要任何提示。
     const current = hookInput.model ?? sessionModels.get(hookInput.sessionID)
     if (current && (await imageSupport(current.providerID, current.modelID))) return
+
+    // 空链降级：没有任何可用视觉模型时不注入 hint、不落盘——落盘只会制造没有
+    // 视觉模型可消费的垃圾文件；交给核心 unsupportedParts 对图片 part 的默认处理。
+    const chain = await resolveChain()
+    if (chain.length === 0) return
 
     // 每张图落盘并生成两行提示；任何一张落盘失败就跳过该图（不影响其余图片）。
     const lines: string[] = []
