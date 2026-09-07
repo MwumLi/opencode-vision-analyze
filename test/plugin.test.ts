@@ -81,13 +81,47 @@ describe("导出形状与选项校验", () => {
     expect(typeof mod.server).toBe("function")
   })
 
-  test("缺 model 选项或格式非法时抛错", async () => {
+  test("model 格式非法（缺 provider/model 斜杠）：抛错并提示格式", async () => {
     const client = makeStubClient()
     const input = makePluginInput(dir, client)
-    await expect(loadPlugin(input, {} as PluginOptions)).rejects.toThrow('requires a "model" option')
     await expect(loadPlugin(input, { model: "no-slash" } as PluginOptions)).rejects.toThrow(
-      'requires a "model" option',
+      /option "model" must be in "provider\/model" format/,
     )
+  })
+
+  test("model 与 models 并存：抛错（互斥）", async () => {
+    const client = makeStubClient()
+    const input = makePluginInput(dir, client)
+    await expect(
+      loadPlugin(input, { model: "test/vision-model", models: ["test/other-vision"] } as PluginOptions),
+    ).rejects.toThrow(/mutually exclusive/)
+  })
+
+  test("models 含非法元素：抛错且信息含 models[1]", async () => {
+    const client = makeStubClient()
+    const input = makePluginInput(dir, client)
+    await expect(
+      loadPlugin(input, { models: ["a/b", "no-slash"] } as PluginOptions),
+    ).rejects.toThrow(/option "models\[1\]" must be in "provider\/model" format/)
+  })
+
+  test("model 与 models 均缺：自动模式正常加载并返回 hooks", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions)
+    expect(hooks["chat.message"]).toBeTypeOf("function")
+    expect(hooks.dispose).toBeTypeOf("function")
+    expect(hooks.tool).toBeDefined()
+  })
+
+  test("宽容校验：unlisted_fallback / free_first 传非布尔按 false 处理，不抛错", async () => {
+    const client = makeStubClient()
+    const input = makePluginInput(dir, client)
+    const loaded = await loadPlugin(input, {
+      model: "test/vision-model",
+      unlisted_fallback: "yes",
+      free_first: 1,
+    } as unknown as PluginOptions)
+    expect(loaded.hooks["chat.message"]).toBeTypeOf("function")
   })
 
   test("合法 model 选项正常加载并返回 hooks", async () => {

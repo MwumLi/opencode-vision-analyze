@@ -99,15 +99,46 @@ const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
  */
 const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): Promise<Hooks> => {
   // ---- 选项解析与校验 ----------------------------------------------------
-  const model = optionsArg?.model
-  if (typeof model !== "string" || !model.includes("/")) {
-    throw new Error(
-      `opencode-vision-analyze requires a "model" option in "provider/model" format, got: ${JSON.stringify(model)}`,
-    )
+  // 归一化规则：model 是单字符串（等价 models:["provider/model"]）；models 是有序候选
+  // 数组。二者并存视为冲突报错；两者均缺 → explicit 为空（进入自动发现，见 Task 3
+  // resolveChain）。model 由必填改为可选。
+  const modelOption = optionsArg?.model
+  const modelsOption = optionsArg?.models
+  const hasModel = typeof modelOption === "string" && modelOption.trim() !== ""
+  const hasModels = Array.isArray(modelsOption) && modelsOption.length > 0
+  if (hasModel && hasModels) {
+    throw new Error('opencode-vision-analyze options "model" and "models" are mutually exclusive')
   }
-  const separator = model.indexOf("/")
-  const visionProviderID = model.slice(0, separator)
-  const visionModelID = model.slice(separator + 1)
+  // 收集字符串候选并逐项校验 provider/model 格式（modelID 允许含 "/"，按首个 "/" 切分）。
+  // 逐项 throw：单 model 报 label "model"，数组报 "models[i]"；保序去重（重复只留首个）。
+  const raw = hasModel ? [modelOption as string] : hasModels ? (modelsOption as string[]) : []
+  const explicitModels: Array<{ providerID: string; modelID: string }> = []
+  const seenKeys = new Set<string>()
+  raw.forEach((item, index) => {
+    const label = hasModel ? "model" : `models[${index}]`
+    if (typeof item !== "string" || !item.includes("/")) {
+      throw new Error(
+        `opencode-vision-analyze option "${label}" must be in "provider/model" format, got: ${JSON.stringify(item)}`,
+      )
+    }
+    const sep = item.indexOf("/")
+    if (seenKeys.has(item)) return // 重复模型只保留首个
+    seenKeys.add(item)
+    explicitModels.push({ providerID: item.slice(0, sep), modelID: item.slice(sep + 1) })
+  })
+  // unlisted_fallback：显式链耗尽后是否自动续接未列出的 image-capable 模型（仅显式配置时
+  // 生效）。free_first：自动发现档序是否反转（匿名/内置 custom 优先，默认 config 优先）。
+  // 二者按严格布尔取真，非布尔值宽容忽略按 false 处理（与下方 timeout_ms 的宽容校验一致）。
+  const fallbackUnlisted = optionsArg?.unlisted_fallback === true
+  const freeFirst = optionsArg?.free_first === true
+
+  // ---- Task 4 兼容桩（本 Task 不引入链式重构） --------------------------------
+  // describeImage / format 标签 / onChatMessage 递归防护目前仍引用下面两个常量。
+  // 为让本 Task 编译通过且不改动 describeImage 逻辑主体，此处从显式首个候选派生；
+  // 无显式配置（自动模式）时用占位空串。Task 4 改为逐候选链式尝试后整体移除。
+  const firstExplicit = explicitModels[0]
+  const visionProviderID = firstExplicit?.providerID ?? ""
+  const visionModelID = firstExplicit?.modelID ?? ""
 
   // 子会话请求的超时时间：timeout_ms 为正数时生效，默认 60 秒。
   const timeoutOption = optionsArg?.timeout_ms
