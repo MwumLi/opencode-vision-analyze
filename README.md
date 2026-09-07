@@ -34,7 +34,7 @@ Highlights:
 ## Requirements
 
 - [opencode](https://opencode.ai) (plugins are loaded with Bun; npm plugins are installed automatically at startup)
-- a vision model you have access to, referenced as `provider/model` (e.g. `"openai/gpt-4o-mini"`, `"anthropic/claude-sonnet-4-5"`)
+- a vision model you have access to, referenced as `provider/model` (e.g. `"openai/gpt-4o-mini"`, `"anthropic/claude-sonnet-4-5"`); provide one or more as an ordered `models` list, or none to auto-discover
 - supported image extensions: png / jpg / jpeg / gif / webp
 
 ## Installation
@@ -45,7 +45,7 @@ Highlights:
 // opencode.json (project or global)
 {
   "plugin": [
-    ["opencode-vision-analyze", { "model": "openai/gpt-4o-mini" }]
+    ["opencode-vision-analyze", { "models": ["openai/gpt-4o-mini"] }]
   ]
 }
 ```
@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/v0.1
 // opencode.json
 {
   "plugin": [
-    ["./.opencode/vision-analyze.ts", { "model": "openai/gpt-4o-mini" }]
+    ["./.opencode/vision-analyze.ts", { "models": ["openai/gpt-4o-mini"] }]
   ]
 }
 ```
@@ -81,9 +81,8 @@ Notes for the curl path:
 
 | Option | Required | Default | Description |
 |---|---|---|---|
-| `model` | no | — | Single vision model in `provider/model` format, e.g. `"anthropic/claude-sonnet-4-5"`. Equivalent to `models: ["..."]`. Mutually exclusive with `models`. If neither `model` nor `models` is set, the plugin auto-discovers all image-capable models. |
-| `models` | no | — | Ordered candidate list of vision models (`provider/model`), tried one after another until one succeeds. Mutually exclusive with `model`. |
-| `unlisted_fallback` | no | `false` | When an explicit `model`/`models` chain is configured and it is exhausted, keep going with image-capable models that were not listed. |
+| `models` | no | — | Ordered candidate list of vision models (`provider/model`), tried one after another until one succeeds. A single vision model is written as `models: ["..."]`. When omitted (or an empty array) the plugin auto-discovers all image-capable models. |
+| `unlisted_fallback` | no | `false` | When an explicit `models` chain is configured and it is exhausted, keep going with image-capable models that were not listed. |
 | `free_first` | no | `false` | In auto-discovery, prefer anonymous/built-in free providers (`custom` source) ahead of config-defined ones — reverses the source-tier order. |
 | `timeout_ms` | no | `60000` | Timeout (ms) budget for each individual `create`/`prompt` request inside the vision sub-session |
 
@@ -136,7 +135,7 @@ vision_analyze tool:
 Key behaviors:
 
 - **Capability gating** — queries `config.providers()` capabilities; results cached per process. A vision-capable main model never gets hints or routing.
-- **Candidate chain** — one or more vision models (`model`/`models`) are tried in order until one succeeds. Explicit models always head the chain. With no explicit config the plugin auto-discovers every image-capable model, ordered by provider source (config first, then env/api, then custom/anonymous; reversed with `free_first: true`). With `unlisted_fallback: true`, an exhausted explicit chain continues onto unlisted image-capable models.
+- **Candidate chain** — the `models` list is tried in order until one succeeds. Explicit models always head the chain. With no explicit config (or an empty `models` list) the plugin auto-discovers every image-capable model, ordered by provider source (config first, then env/api, then custom/anonymous; reversed with `free_first: true`). With `unlisted_fallback: true`, an exhausted explicit chain continues onto unlisted image-capable models.
 - **Recursion guard (whole chain)** — messages from the candidate chain's own sub-sessions are never re-processed.
 - **Empty chain degradation** — if no vision model is available at all, the plugin still loads: pasted images are left untouched (no hint injected) and the tool returns a clear error instead of routing.
 - **Loginless free models** — auto-discovery uses `config.providers()`, the same source as the `/models` picker, so image-capable zen free models are found even without login (their provider is `custom` source → default last tier; put them first with `free_first: true`).

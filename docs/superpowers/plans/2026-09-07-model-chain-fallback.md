@@ -11,6 +11,20 @@
 
 ---
 
+## 变更（2026-09-08）：移除 `model`，唯一入口 `models`
+
+用户决策：新项目不保留兼容 → `models: string[]` 成为唯一显式配置入口，`model` 单字符串选项删除（单模型写作 `models:["x"]`）。
+
+已执行（commit `5df3523`）：
+
+- `src/index.ts`：删除 `modelOption`/`hasModel`/互斥抛错分支；`models` 给定但非数组 → 抛错（提示需为 `"provider/model"` 字符串数组）；`models` 缺省或 `[]` → 自动模式；docstring 与空链文案同步去掉 `model`。
+- `test/plugin.test.ts`：机械替换插件选项 `model:` → `models: [...]`；校验用例改写（非数组抛错 / `[]` 自动模式 / 下标 `models[i]` 报错），42 pass。
+- 文档：README 双语选项表与示例、fallback spec（含本变更记录）、09-05 快照头部注释已同步。
+
+本计划 Task 2 中「`model` 与 `models` 并存报错 / `model` 单字符串入口」等旧步骤已被上述变更取代，仅作历史记录保留。
+
+---
+
 ## 文件映射
 
 | 文件 | 动作 | 职责 |

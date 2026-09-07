@@ -36,7 +36,7 @@
 ## 运行前提
 
 - [opencode](https://opencode.ai)（插件由 Bun 加载；npm 插件启动时自动安装）
-- 一个你可用的视觉模型，以 `provider/model` 引用（如 `"openai/gpt-4o-mini"`、`"anthropic/claude-sonnet-4-5"`）
+- 你可用的视觉模型，以 `provider/model` 引用（如 `"openai/gpt-4o-mini"`、`"anthropic/claude-sonnet-4-5"`）；可配置一个或多个为有序 `models` 列表，或一个都不配走自动发现
 - 受支持的图片扩展名：png / jpg / jpeg / gif / webp
 
 ## 安装
@@ -47,7 +47,7 @@
 // opencode.json（项目级或全局）
 {
   "plugin": [
-    ["opencode-vision-analyze", { "model": "openai/gpt-4o-mini" }]
+    ["opencode-vision-analyze", { "models": ["openai/gpt-4o-mini"] }]
   ]
 }
 ```
@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/v0.1
 // opencode.json
 {
   "plugin": [
-    ["./.opencode/vision-analyze.ts", { "model": "openai/gpt-4o-mini" }]
+    ["./.opencode/vision-analyze.ts", { "models": ["openai/gpt-4o-mini"] }]
   ]
 }
 ```
@@ -83,9 +83,8 @@ curl 方式说明：
 
 | 选项 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `model` | 否 | — | 单个视觉模型，`provider/model` 格式，如 `"anthropic/claude-sonnet-4-5"`、`"openai/gpt-4o-mini"`。等价于 `models: ["..."]`；与 `models` 互斥。两者均缺时自动发现全部 image-capable 模型。 |
-| `models` | 否 | — | 有序候选视觉模型数组（`provider/model`），逐个尝试直到成功即止。与 `model` 互斥。 |
-| `unlisted_fallback` | 否 | `false` | 显式 `model`/`models` 链耗尽后，自动续试未列入清单的 image-capable 模型。 |
+| `models` | 否 | — | 有序候选视觉模型数组（`provider/model`），逐个尝试直到成功即止；单个视觉模型写作 `models: ["..."]`。缺省或空数组时自动发现全部 image-capable 模型。 |
+| `unlisted_fallback` | 否 | `false` | 显式 `models` 链耗尽后，自动续试未列入清单的 image-capable 模型。 |
 | `free_first` | 否 | `false` | 自动发现时优先匿名/内置免费（`custom` 源）provider，置于 config 源之前——反转 source 档序。 |
 | `timeout_ms` | 否 | `60000` | 子会话内每次 create/prompt 请求各自的超时预算（毫秒） |
 
@@ -138,7 +137,7 @@ vision_analyze 工具：
 关键行为：
 
 - **能力门控** —— 查询 `config.providers()` 能力字段，进程级缓存；有视觉能力的主模型永远不会收到提示或被路由。
-- **候选链** —— 一个或多个视觉模型（`model`/`models`）按序逐个尝试直到成功。显式模型恒在链首；无显式配置时自动发现全部 image-capable 模型，按 provider 来源排序（config 最前 → env/api → custom/匿名；`free_first: true` 时反转）。`unlisted_fallback: true` 时显式链耗尽后会续试未列出的 image-capable 模型。
+- **候选链** —— `models` 列表按序逐个尝试直到成功。显式模型恒在链首；无显式配置（或 `models` 为空数组）时自动发现全部 image-capable 模型，按 provider 来源排序（config 最前 → env/api → custom/匿名；`free_first: true` 时反转）。`unlisted_fallback: true` 时显式链耗尽后会续试未列出的 image-capable 模型。
 - **递归防护（整链）** —— 候选链子会话发起的消息不会被再次处理。
 - **空链降级** —— 完全没有可用视觉模型时插件仍正常加载：贴图保持原样（不注入 hint），工具返回清晰错误而非路由。
 - **免登录免费模型** —— 自动发现与 `/models` 选择器同源（`config.providers()`），免登录也可发现的 zen free 视觉模型会进入候选链（其 provider 为 `custom` 源 → 默认最末档；`free_first: true` 可提到最前）。

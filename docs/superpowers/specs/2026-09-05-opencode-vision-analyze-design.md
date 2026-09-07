@@ -4,6 +4,8 @@
 > 关联实现文件：`src/index.ts`、`test/plugin.test.ts`、`test/helpers.ts`
 > 说明：本文档为插件基础架构设计快照；模型选择已演进为多模型候选链，见
 >   `docs/superpowers/specs/2026-09-07-model-chain-fallback-design.md`。
+>   2026-09-08 起视觉模型配置入口收敛为唯一 `models: string[]`（`model` 已移除），
+>   以演进 spec 的「变更记录」为准；本快照中相关旧表述不构成当前行为。
 
 > 本文档是插件的设计决策与机制说明存档，面向维护者。面向使用者的文档见 [README](../README.zh.md)。
 

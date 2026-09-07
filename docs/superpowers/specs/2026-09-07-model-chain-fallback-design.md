@@ -1,6 +1,9 @@
 # 多视觉模型候选链（fallback chain）设计
 
-> 状态：定稿（2026-09-07，实现完成并经议会验收）。
+> 状态：定稿（2026-09-07，实现完成并经议会验收；2026-09-08 按用户决策变更一次，见下）。
+> 变更记录（2026-09-08）：新项目不保留兼容 → 视觉模型配置入口收敛为**唯一 `models: string[]`**，
+> 删除 `model` 单字符串选项（其语义由 `models: ["x"]` 表达）。下文正文已按此更新；
+> 早期「model 与 models 并存/互斥」的旧决策一律失效。
 > 关联实现文件：`src/index.ts`、`test/plugin.test.ts`、`test/helpers.ts`
 > 关联文档：`docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md`、`README.md`、`README.zh.md`
 
@@ -12,11 +15,11 @@
 
 1. 支持有序配置多个视觉模型，逐个尝试，成功即止，全部失败则聚合报错。
 2. `unlisted_fallback` 开关：显式配置耗尽后，自动续接未列入清单的 image-capable 模型。
-3. `model` 不再必填：无显式配置时默认自动尝试全部 image-capable 模型。
+3. `models` 为唯一显式入口且可选：缺省（或空数组）时默认自动尝试全部 image-capable 模型。
 
 ## 核心架构
 
-**一切配置形态先归一化为一个有序 `chain` 数组；运行时只有一条链式循环，不感知任何开关分支。** 无论配置来源是 `model`、`models` 还是缺省，都统一构造出一个 `models` 数组，再统一走链式尝试。
+**一切配置形态先归一化为一个有序 `chain` 数组；运行时只有一条链式循环，不感知任何开关分支。** 配置来源只有 `models`（或缺省），都统一构造出一个 `chain` 数组，再统一走链式尝试。
 
 `unlisted_fallback` 是**纯构建期开关**，只参与最终 `chain` 数组的组成（在 `resolveChain()` 内消费）；链一旦定型，执行逻辑只需「一个接一个尝试直到成功或耗尽」。
 
@@ -24,8 +27,8 @@
 
 | 决策项 | 结论 |
 |---|---|
-| 选项兼容 | 保留 `model`（单字符串，等价 `models: ["x"]`）；新增 `models`（有序数组）；二者并存报错 |
-| 默认行为 | `model`/`models` 均缺 → 自动模式：`chain = 全部 image-capable 模型`（忽略 `unlisted_fallback`，等效默认生效） |
+| 配置入口 | 只保留 `models`（有序数组，`string[]`）：单模型写作 `models: ["x"]`；删除 `model` 单字符串选项 |
+| 默认行为 | `models` 缺省或空数组 → 自动模式：`chain = 全部 image-capable 模型`（忽略 `unlisted_fallback`，等效默认生效） |
 | 显式 + fallback | `explicit 非空 && unlisted_fallback = true` → `chain = explicit ++ (inventory − explicit)` |
 | 显式 + 无 fallback | `chain = explicit`（默认 `unlisted_fallback = false`） |
 | 运行时 | 单一路径 `describeWithChain(chain, ...)`，逐候选 `attempt()`；任何失败推进、abort 中止整链、全败聚合成错误 |
@@ -41,27 +44,25 @@
 
 ```
 输入:
-  model?: string
-  models?: string[]
+  models?: string[]        // 唯一显式入口；缺省或 [] = 自动模式
   unlisted_fallback?: boolean
   free_first?: boolean          // 发现排序方向：false=config 优先（默认）；true=匿名/内置（custom）优先
   timeout_ms?: number
 
 校验:
-  model 与 models 并存                      → Error（冲突）
-  model 给定但非法 provider/model 格式       → Error
-  models 中任一元素非法格式                  → Error（报错信息含元素下标）
-  model 与 models 均缺                      → explicit = []（合法，进入自动模式）
+  models 给定但非数组（如字符串）             → Error（提示需为 "provider/model" 字符串数组）
+  models 中任一元素非法格式                  → Error（报错信息含元素下标 models[i]）
+  models 缺省或空数组                       → explicit = []（合法，进入自动模式）
   unlisted_fallback 非 boolean              → 忽略并按 false 处理（与现有 timeout_ms 的宽容校验一致）
   free_first 非 boolean                     → 忽略并按 false 处理（同前）
 ```
 
-`model` 由必填改为可选。
+`models` 为可选（缺省 = 自动模式）。原 `model` 单字符串入口已于 2026-09-08 移除。
 
 ## 候选链构建 `resolveChain()`（懒加载 + memoize）
 
 ```
-explicit  = normalize(model | models)          // 保序去重（重复模型只保留首个）
+explicit  = normalize(models)               // 保序去重（重复模型只保留首个）
 inventory = await listImageCapableModels()     // providers 遍历，image === true，按「发现排序」规则有序
 chain =
   explicit 为空             → inventory
@@ -76,7 +77,7 @@ chain =
 - 稳定排序（档内保持 `config.providers()` 返回顺序，同一 provider 内保持模型返回顺序）：
   - 默认：档序 `config > env/api > custom`；
   - `free_first: true`：档序整体反转 `custom > env/api > config`（匿名/内置免费优先，不读 cost）。
-- 排序只影响自动/fallback 部分；显式 `model`/`models` 恒在链首，不受 `free_first`/档序影响。
+- 排序只影响自动/fallback 部分；显式 `models` 恒在链首，不受 `free_first`/档序影响。
 
 - memoize 为进程级 Promise（chat.message 钩子与 vision_analyze 工具共享一次查询）。
 - inventory 查询同时预填 `imageCapable` 缓存，与现有 `imageSupport()` 同源，避免重复请求。
@@ -93,7 +94,7 @@ chain =
 | `api` | 通过 `opencode auth` / `/connect` 存储的凭据 | `auth login --provider zen` | 档2 |
 | `custom` | 内置匿名 / models.dev 目录默认 / 插件自动加载 | 免登录的 zen free | 档3 |
 
-档序只在 inventory（自动/fallback 部分）内生效；显式 `model`/`models` 恒在链首。`source` 缺失或为未知值归档3（最保守，不抢占前面档位）。
+档序只在 inventory（自动/fallback 部分）内生效；显式 `models` 恒在链首。`source` 缺失或为未知值归档3（最保守，不抢占前面档位）。
 
 ## 补充说明：免登录的 zen free 视觉模型
 
@@ -114,11 +115,11 @@ chain =
 
 | 配置 | `unlisted_fallback` | `chain` 组成 |
 |---|---|---|
-| 无 `model`/`models` | 忽略（无效） | 全部 image-capable 模型（自动，档序见上） |
+| `models` 缺省 / `[]` | 忽略（无效） | 全部 image-capable 模型（自动，档序见上） |
 | `models: [A, B]` | `false`（默认） | `[A, B]` |
 | `models: [A, B]` | `true` | `[A, B] ++ (inventory − {A, B})` |
-| `model: A` | `true` | `[A] ++ (inventory − {A})` |
-| `model: A` | `false` | `[A]`（长度 1，仍走统一链式路径） |
+| `models: [A]` | `false`（默认） | `[A]`（长度 1，仍走统一链式路径） |
+| `models: [A]` | `true` | `[A] ++ (inventory − {A})` |
 
 inventory 排序：默认档序 `config > env/api > custom`；`free_first: true` 时反转 `custom > env/api > config`。两表正交：`free_first` 只改 inventory 内相对顺序，不改 chain 的组成规则。
 
@@ -168,7 +169,7 @@ Image analysis failed: all N candidate model(s) failed: a/b: <reason>; c/d: <rea
 - 空链工具文案建议：
 
 ```
-Image analysis failed: no image-capable model configured (set the plugin model/models option or configure an image-capable provider model)
+Image analysis failed: no image-capable model configured (set the plugin models option or configure an image-capable provider model)
 ```
 
 - 子会话仍逐候选「用后即删」，`dispose` 兜底清理残留（不变）。
@@ -182,7 +183,7 @@ helpers.ts 调整：
 
 plugin.test.ts 新增：
 
-1. 选项校验：`model` + `models` 冲突抛错；models 非法元素抛错；均缺合法加载（自动模式）。
+1. 选项校验：`models` 传字符串而非数组 → 抛错（提示需为数组）；任一元素非法 → 抛错且含下标 `models[i]`；缺省或 `[]` → 合法加载（自动模式）。
 2. 显式有序链：A 失败 → B 成功；prompt 调用顺序 `[A, B]`；输出标签为 B。
 3. 全败聚合：两候选均失败 → 输出含两候选及各自原因，不抛错。
 4. abort：候选 A 挂起中 abort → 不再尝试 B（prompt 调用仅 A 一次），输出 Aborted。
@@ -198,7 +199,7 @@ plugin.test.ts 新增：
 
 ## 文档更新
 
-- README.md / README.zh.md：选项表新增 `models`、`unlisted_fallback`、`free_first`；`model` 标为可选；移除「单模型无备选链」限制；补充候选链示例、发现排序（source 档序）与 zen free 免登录说明。
+- README.md / README.zh.md：选项表只保留 `models`（`model` 行已删）、新增 `unlisted_fallback`、`free_first`；移除「单模型无备选链」限制；补充候选链示例、发现排序（source 档序）与 zen free 免登录说明。
 - docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md：新增决策行（候选链归一化 / 单一路径 / fallback 构建期语义 / 发现排序按 Provider.source / free_first 反转档序 / 缓存记录 modelId / 空链降级）。
 
 ## 验证门禁
