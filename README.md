@@ -8,34 +8,13 @@ A tool-based vision routing plugin for [opencode](https://opencode.ai): when the
 
 **Zero runtime dependencies.** Only node builtins (`crypto`/`fs`/`path`) and type-only imports — nothing to install beyond the plugin itself.
 
-## Why this one
-
-There are already a few vision plugins in the ecosystem. The differences:
-
-| | opencode-vision | opencode-vision-router | opencode-image-vision | **opencode-vision-analyze** |
-|---|---|---|---|---|
-| Mechanism | skill + subagent delegation | pointer + subagent delegation | direct SDK call (read-image / read-ocr) | **tool + plugin-managed sub-session** |
-| Vision model source | auto-discovered image models | single `model` option | per-feature provider/model | ordered `models` candidate chain + auto-discovery |
-| Main-model capability detection | models.dev catalog + auth | `chat.params` live learning | name regex (fragile) | `config.providers()` capabilities (cached) |
-| Image persistence | /tmp (session+part hash) | tmpDir | user dir / clipboard dir | `.opencode/vision/` content-addressed sha256 |
-| Output | subagent answers itself | subagent answers itself | description / OCR text | description text (with cache) |
-| Vision-capable main model | skip registration | skip routing (`force` to override) | skipModels / forceDescription | skip injection + **native fast path** (tool returns the raw image as attachment) |
-| Request path | opencode session | opencode session | **direct third-party SDK** | opencode sub-session (unified auth, no extra credentials) |
-| Failure visibility | via subagent tool chain | via subagent | tool output | tool output (never throws) |
-
-Highlights:
+## Features
 
 - **Tool-based, not pre-analysis.** The turn starts immediately; the model decides when (and with which question) to look. No blocking on submit, failures are visible and retryable inside the agent loop. Same philosophy as production-proven agent designs.
 - **Question-aware descriptions.** The model passes its own focused question to `vision_analyze` — not a one-shot generic caption computed at submit time.
 - **Native fast path.** If the main model is vision-capable, `vision_analyze` skips the vision model entirely and returns the raw image as a tool attachment.
 - **Content-addressed cache.** Images are stored as `<sha256>.<ext>` (deduped across sessions); descriptions are cached per `<image-hash>:<question>` — the same image with the same question is described exactly once.
 - **Unified auth.** The vision call runs through an opencode sub-session, so it reuses the provider credentials opencode already manages. No extra API key plumbing.
-
-## Requirements
-
-- [opencode](https://opencode.ai) (plugins are loaded with Bun; npm plugins are installed automatically at startup)
-- a vision model you have access to, referenced as `provider/model` (e.g. `"openai/gpt-4o-mini"`, `"anthropic/claude-sonnet-4-5"`); provide one or more as an ordered `models` list, or none to auto-discover
-- supported image extensions: png / jpg / jpeg / gif / webp
 
 ## Installation
 
@@ -85,6 +64,8 @@ Notes for the curl path:
 | `unlisted_fallback` | no | `false` | When an explicit `models` chain is configured and it is exhausted, keep going with image-capable models that were not listed. |
 | `free_first` | no | `false` | In auto-discovery, prefer anonymous/built-in free providers (`custom` source) ahead of config-defined ones — reverses the source-tier order. |
 | `timeout_ms` | no | `60000` | Timeout (ms) budget for each individual `create`/`prompt` request inside the vision sub-session |
+
+Supported image extensions: png / jpg / jpeg / gif / webp.
 
 An ordered-candidates example with auto-fallback and free-first discovery:
 

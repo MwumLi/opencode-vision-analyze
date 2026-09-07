@@ -10,34 +10,13 @@
 
 **零运行时依赖。** 只用 node 内置模块（`crypto`/`fs`/`path`）和纯类型导入——除插件本身外无需安装任何东西。
 
-## 为什么选这个
-
-生态里已有若干视觉插件，差异如下：
-
-| | opencode-vision | opencode-vision-router | opencode-image-vision | **opencode-vision-analyze** |
-|---|---|---|---|---|
-| 机制 | skill + 子代理委托 | 指针 + 子代理委托 | 直连 SDK（read-image / read-ocr） | **工具 + 插件自管子会话** |
-| 视觉模型来源 | 自动发现的视觉模型 | 单一 `model` 选项 | 每功能独立 provider/model | 有序 `models` 候选链 + 自动发现 |
-| 主模型能力判定 | models.dev 目录 + auth | `chat.params` 实时学习 | 名字正则（脆弱） | `config.providers()` 能力查询（缓存） |
-| 图片落盘 | /tmp（会话+part 哈希） | tmpDir | 用户目录 / 剪贴板目录 | `.opencode/vision/` 内容寻址 sha256 |
-| 产出 | 子代理自行作答 | 子代理自行作答 | 描述 / OCR 文本 | 描述文本（带缓存） |
-| 有视觉主模型 | 跳过注册 | 跳过路由（`force` 可强制） | skipModels / forceDescription | 跳过注入 + **原生快速路径**（工具直接回传原图附件） |
-| 请求路径 | opencode 会话 | opencode 会话 | **第三方 SDK 直连** | opencode 子会话（统一鉴权，无需额外密钥） |
-| 失败可见性 | 经子代理工具链 | 经子代理 | 工具输出 | 工具输出（永不抛错） |
-
-亮点：
+## 特性
 
 - **工具化，而非提交时预分析。** 轮次即时启动；模型自己决定何时看图、带着什么问题看。提交零阻塞，失败在 agent 循环里可见、可重试。
 - **描述针对问题。** 模型把自己关注的问题传给 `vision_analyze`——而不是提交时预生成的一次性通用描述。
 - **原生快速路径。** 主模型本身有视觉能力时，`vision_analyze` 完全跳过视觉模型，直接把原图作为工具附件返回。
 - **内容寻址缓存。** 图片按 `<sha256>.<ext>` 落盘（跨会话天然去重）；描述按 `<图片哈希>:<问题>` 缓存——同图同问题只描述一次。
 - **统一鉴权。** 视觉调用走 opencode 子会话，复用 opencode 已管理的 provider 凭据，无需额外配置 API Key。
-
-## 运行前提
-
-- [opencode](https://opencode.ai)（插件由 Bun 加载；npm 插件启动时自动安装）
-- 你可用的视觉模型，以 `provider/model` 引用（如 `"openai/gpt-4o-mini"`、`"anthropic/claude-sonnet-4-5"`）；可配置一个或多个为有序 `models` 列表，或一个都不配走自动发现
-- 受支持的图片扩展名：png / jpg / jpeg / gif / webp
 
 ## 安装
 
@@ -87,6 +66,8 @@ curl 方式说明：
 | `unlisted_fallback` | 否 | `false` | 显式 `models` 链耗尽后，自动续试未列入清单的 image-capable 模型。 |
 | `free_first` | 否 | `false` | 自动发现时优先匿名/内置免费（`custom` 源）provider，置于 config 源之前——反转 source 档序。 |
 | `timeout_ms` | 否 | `60000` | 子会话内每次 create/prompt 请求各自的超时预算（毫秒） |
+
+受支持的图片扩展名：png / jpg / jpeg / gif / webp。
 
 有序候选 + 自动续接 + 免费优先的配置示例：
 
