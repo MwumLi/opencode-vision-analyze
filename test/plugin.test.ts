@@ -3,8 +3,8 @@
  *
  * 通过 stub 的插件运行环境（见 helpers.ts）直接调用钩子与工具，
  * 覆盖：导出形状 / 选项校验 / chat.message 门控与落盘 / 能力缓存 /
- * 工具描述路径 / 快速路径 / 描述缓存 / URL 下载与错误路径 / 超时 /
- * 永不抛错 / dispose 清理。
+ * 工具描述路径 / 候选链 fallback 与 abort 语义 / 快速路径 / 描述缓存 /
+ * URL 下载与错误路径 / 超时 / 永不抛错 / dispose 清理。
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test"
 import { access, mkdir, writeFile } from "node:fs/promises"
@@ -25,6 +25,8 @@ import {
   loadPlugin,
   chatOutput,
   chatInput,
+  providerStub,
+  providersStub,
   type LoadedPlugin,
 } from "./helpers"
 
@@ -288,6 +290,113 @@ describe("vision_analyze 工具", () => {
   })
 })
 
+describe("vision 候选链 fallback（describeWithChain）", () => {
+  test("显式有序链：首候选失败自动续试下一候选，prompt 顺序与标签正确", async () => {
+    const client = makeStubClient()
+    // 首候选（vision-model）返回错误 → 应续试 other-vision 成功
+    client.setPromptBehavior((model) =>
+      model?.modelID === "vision-model"
+        ? { error: new Error("boom for vision") }
+        : { data: { parts: [{ type: "text", text: "a red square" }] } },
+    )
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model", "test/other-vision"],
+    } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // 成功的是续试的候选 → 标签标注它
+    expect(result.output).toContain("described by test/other-vision")
+    expect(result.output).toContain("a red square")
+    // prompt 按候选链顺序逐个尝试：首失败 → 次成功，不多调
+    expect(client.calls.prompt.map((p) => p.model)).toEqual([
+      { providerID: "test", modelID: "vision-model" },
+      { providerID: "test", modelID: "other-vision" },
+    ])
+    // 每个候选各建/删一个子会话
+    expect(client.calls.create.length).toBe(2)
+    expect(client.calls.deleted.length).toBe(2)
+  })
+
+  test("全部候选失败：聚合各候选原因，不抛错", async () => {
+    const client = makeStubClient()
+    client.setPromptBehavior((model) =>
+      model?.modelID === "vision-model"
+        ? { error: new Error("boomA") }
+        : { error: new Error("boomB") },
+    )
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model", "test/other-vision"],
+    } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "x" },
+      toolCtx(new AbortController().signal),
+    )
+
+    expect(result.output).toContain("Image analysis failed: all 2 candidate model(s) failed")
+    expect(result.output).toContain("test/vision-model: boomA")
+    expect(result.output).toContain("test/other-vision: boomB")
+    expect(result.title).toBe("vision_analyze")
+  })
+
+  test("运行中 abort：中止整链，不再尝试后续候选", async () => {
+    const client = makeStubClient()
+    // 首候选永不 resolve（模拟挂起）；后续候选即便正常也不应被推进
+    client.setPromptBehavior((model) =>
+      model?.modelID === "vision-model"
+        ? new Promise(() => {})
+        : { data: { parts: [{ type: "text", text: "a red square" }] } },
+    )
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model", "test/other-vision"],
+    } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const controller = new AbortController()
+    const pending = analyze({ image_path: persistedPath(), question: "x" }, toolCtx(controller.signal))
+
+    // 等首候选的 prompt 已发出（进入挂起）后再中止
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(client.calls.prompt.length).toBe(1)
+    controller.abort()
+    const result = await pending
+
+    expect(result.output).toContain("Image analysis failed: Aborted")
+    // 只尝试了首候选一次，没有推进 other-vision
+    expect(client.calls.prompt.length).toBe(1)
+    expect(client.calls.create.length).toBe(1)
+  })
+
+  test("空链：无 image-capable 模型时返回友好错误且不建子会话", async () => {
+    const client = makeStubClient()
+    client.setProvidersResult(providersStub(providerStub("test", "config", { "text-model": { image: false } })))
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "x" },
+      toolCtx(new AbortController().signal),
+    )
+
+    expect(result.output).toContain("Image analysis failed: no image-capable model configured")
+    expect(client.calls.create.length).toBe(0)
+  })
+})
+
 describe("URL 图片下载", () => {
   /** 保存/恢复 globalThis.fetch 的统一入口。 */
   function mockFetch(handler: typeof fetch): () => void {
@@ -414,7 +523,9 @@ describe("超时 / 中止 / 容错", () => {
       toolCtx(new AbortController().signal),
     )
 
-    expect(result.output).toContain("Image analysis failed: vision model call timed out after 10ms")
+    // 超时文案聚合进全败信息：单候选链 → all 1 candidate model(s) failed
+    expect(result.output).toContain("all 1 candidate model(s) failed")
+    expect(result.output).toContain("vision model call timed out after 10ms")
     // 超时路径的 finally 仍会删除子会话
     expect(client.calls.deleted).toContain("ses_sub_1")
   })
@@ -445,7 +556,9 @@ describe("超时 / 中止 / 容错", () => {
       { image_path: persistedPath(), question: "x" },
       toolCtx(new AbortController().signal),
     )
-    expect(result.output).toContain("Image analysis failed: create boom")
+    // 创建失败同样收敛为全败聚合文案
+    expect(result.output).toContain("all 1 candidate model(s) failed")
+    expect(result.output).toContain("create boom")
   })
 
   test("dispose：兜底清理挂起路径上的孤儿子会话", async () => {

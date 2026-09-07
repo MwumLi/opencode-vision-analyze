@@ -132,10 +132,10 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   const fallbackUnlisted = optionsArg?.unlisted_fallback === true
   const freeFirst = optionsArg?.free_first === true
 
-  // ---- Task 4 兼容桩（本 Task 不引入链式重构） --------------------------------
-  // describeImage / format 标签 / onChatMessage 递归防护目前仍引用下面两个常量。
-  // 为让本 Task 编译通过且不改动 describeImage 逻辑主体，此处从显式首个候选派生；
-  // 无显式配置（自动模式）时用占位空串。Task 4 改为逐候选链式尝试后整体移除。
+  // ---- onChatMessage 递归防护引用（Task 6 换整链防护前暂保留） ----------------
+  // describeImage 已在 Task 4 重构为 attemptModel/describeWithChain 逐候选尝试，
+  // 不再依赖下面两个常量；目前仅 onChatMessage 的递归防护仍按「显式链首候选」
+  // 判断（自动模式为占位空串即不拦截），待 Task 6 把防护集扩为整条候选链后移除。
   const firstExplicit = explicitModels[0]
   const visionProviderID = firstExplicit?.providerID ?? ""
   const visionModelID = firstExplicit?.modelID ?? ""
@@ -186,17 +186,22 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     })
   }
 
+  /** 判断错误是否为中止信号（AbortError），供 attemptModel 标记 / 链循环中止整链。 */
+  const isAbortError = (error: unknown): boolean => error instanceof Error && error.name === "AbortError"
+
   /**
-   * 创建临时子会话（parentID 挂在当前会话下，不进会话列表、不生成标题），
-   * 让视觉模型描述一张图片并返回描述文本。
-   * 任何失败（会话创建 / 请求 / 超时 / abort / 无文本）都返回 { ok: false, error }。
-   * 无论成败，finally 中都会删除子会话——用后即删，不留孤儿。
+   * 单个候选的尝试：创建子会话（parentID 挂当前会话）→ 用该候选模型描述 →
+   * 删除子会话。任何失败（创建 / 请求 / 超时 / 中止 / 底层抛错 / 无文本）都
+   * 收敛为 { ok: false } 返回而不向上抛——推进与否交给 describeWithChain 的
+   * 链循环决策；中止额外打 aborted 标记，链循环据此立即停整链。无论成败，
+   * finally 中都删除子会话——用后即删，不留孤儿。
    */
-  const describeImage = async (
+  const attemptModel = async (
+    candidate: { providerID: string; modelID: string },
     image: { bytes: Buffer; mime: string },
     question: string,
     ctx: ToolContext,
-  ): Promise<{ ok: true; text: string } | { ok: false; error: string }> => {
+  ): Promise<{ ok: true; text: string } | { ok: false; error: string; aborted?: boolean }> => {
     const dataURL = `data:${image.mime};base64,${image.bytes.toString("base64")}`
     let subID: string | undefined
     try {
@@ -213,7 +218,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         input.client.session.prompt({
           path: { id: subID },
           body: {
-            model: { providerID: visionProviderID, modelID: visionModelID },
+            model: { providerID: candidate.providerID, modelID: candidate.modelID },
             agent: "build",
             // 子会话禁用全部工具：视觉模型只做纯文本描述，避免它反过来调用
             // vision_analyze 形成递归，也避免任何副作用。
@@ -236,6 +241,9 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         .trim()
       if (!text) return { ok: false, error: "vision model returned no text" }
       return { ok: true, text }
+    } catch (error) {
+      // 异常（超时 / 中止 / 底层抛错）同样收敛为失败结果；aborted 标记交由链循环判断
+      return { ok: false, error: errText(error), aborted: isAbortError(error) }
     } finally {
       if (subID) {
         subSessions.delete(subID)
@@ -243,6 +251,41 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       }
     }
   }
+
+  /**
+   * 候选链描述：沿 resolveChain() 产出的候选链逐个尝试，首个成功即返回（附带
+   * 成功候选的引用键作标签来源）；单个候选失败记录 `${key}: ${error}` 并推进
+   * 下一个；收到 abort（pre-abort 短路或尝试结果的 aborted 标记）立即中止整链；
+   * 全部失败聚合各候选原因；空链返回友好错误。本函数永不抛错。
+   */
+  const describeWithChain = async (
+    image: { bytes: Buffer; mime: string },
+    question: string,
+    ctx: ToolContext,
+  ): Promise<{ ok: true; text: string; modelId: string } | { ok: false; error: string }> => {
+    // pre-abort 短路：不解析候选链、不建子会话，直接以 Aborted 收尾
+    if (ctx.abort.aborted) return { ok: false, error: "Aborted" }
+    const chain = await resolveChain()
+    const failures: string[] = []
+    for (const candidate of chain) {
+      const attempt = await attemptModel(candidate, image, question, ctx)
+      if (attempt.ok) return { ok: true, text: attempt.text, modelId: modelRefKey(candidate) }
+      if (attempt.aborted) return { ok: false, error: attempt.error } // abort 中止整链
+      failures.push(`${modelRefKey(candidate)}: ${attempt.error}`)
+    }
+    if (failures.length === 0) {
+      return {
+        ok: false,
+        error:
+          "no image-capable model configured (set the plugin model/models option or configure an image-capable provider model)",
+      }
+    }
+    return { ok: false, error: `all ${failures.length} candidate model(s) failed: ${failures.join("; ")}` }
+  }
+
+  /** 描述标签：标注图片文件名与产出描述的模型引用键（basename 运行时按图传入）。 */
+  const format = (basename: string, modelId: string, text: string): string =>
+    `[Image: ${basename} — described by ${modelId}]\n${text}`
 
   /**
    * 下载 http(s) URL 指向的图片并落盘到 <visionDir>/<sha256><ext>：
@@ -338,15 +381,21 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
 
       // 描述缓存：内容哈希 + 问题作为 key，命中直接复用（title 标注 cached）。
       const key = `${createHash("sha256").update(image.bytes).digest("hex")}:${question}`
-      const format = (text: string) =>
-        `[Image: ${path.basename(imagePath)} — described by ${visionProviderID}/${visionModelID}]\n${text}`
       const cached = descriptions.get(key)
-      if (cached !== undefined) return { title: `${title} (cached)`, output: format(cached) }
+      if (cached !== undefined) {
+        // Task 4 占位：缓存暂只存纯文本（结构留待 Task 5 改为 { modelId, text }），
+        // 命中标签先用候选链链首的引用键近似标注；入库模型与链首不一致时的
+        // 精确复现标签由 Task 5 修。
+        const head = (await resolveChain())[0]
+        const label = head ? modelRefKey(head) : ""
+        return { title: `${title} (cached)`, output: format(path.basename(imagePath), label, cached) }
+      }
 
-      const result = await describeImage(image, question, ctx)
+      const result = await describeWithChain(image, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
       descriptions.set(key, result.text)
-      return { title, output: format(result.text) }
+      // 成功标签直接用实际产出描述的候选引用键（而非链首近似）
+      return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
     } catch (error) {
       return { title, output: `Image analysis failed: ${errText(error)}` }
     }
