@@ -150,8 +150,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   const sessionModels = new Map<string, { providerID: string; modelID: string }>()
   /** "provider/model" → 是否具备图片输入能力（查询结果缓存，进程级） */
   const imageCapable = new Map<string, boolean>()
-  /** 描述缓存："<sha>:<question>" → 描述文本（同一张图 + 同一个问题只描述一次） */
-  const descriptions = new Map<string, string>()
+  /**
+   * 描述缓存："<sha>:<question>" → 描述结果（同一张图 + 同一个问题只描述一次）。
+   * 值带 modelId：记录实际产出该描述的候选模型，缓存命中时标签沿用入库模型，
+   * 而不是用当前候选链链首近似（链配置变化或 fallback 命中次选时标签才真实）。
+   */
+  const descriptions = new Map<string, { modelId: string; text: string }>()
   /** 本插件创建的子会话 ID 集合（正常路径用后即删，dispose 兜底清理残留） */
   const subSessions = new Set<string>()
 
@@ -383,17 +387,15 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       const key = `${createHash("sha256").update(image.bytes).digest("hex")}:${question}`
       const cached = descriptions.get(key)
       if (cached !== undefined) {
-        // Task 4 占位：缓存暂只存纯文本（结构留待 Task 5 改为 { modelId, text }），
-        // 命中标签先用候选链链首的引用键近似标注；入库模型与链首不一致时的
-        // 精确复现标签由 Task 5 修。
-        const head = (await resolveChain())[0]
-        const label = head ? modelRefKey(head) : ""
-        return { title: `${title} (cached)`, output: format(path.basename(imagePath), label, cached) }
+        // 命中时标签沿用入库时的模型（cached.modelId）：即便此刻候选链链首
+        // 已与入库模型不同，也保持标签真实、不重写。
+        return { title: `${title} (cached)`, output: format(path.basename(imagePath), cached.modelId, cached.text) }
       }
 
       const result = await describeWithChain(image, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
-      descriptions.set(key, result.text)
+      // 入库带上实际产出描述的候选 modelId，供后续缓存命中还原真实标签
+      descriptions.set(key, { modelId: result.modelId, text: result.text })
       // 成功标签直接用实际产出描述的候选引用键（而非链首近似）
       return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
     } catch (error) {

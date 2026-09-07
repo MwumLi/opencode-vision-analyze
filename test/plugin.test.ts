@@ -275,6 +275,40 @@ describe("vision_analyze 工具", () => {
     expect(client.calls.prompt.length).toBe(1)
   })
 
+  test("描述缓存：命中输出沿用入库模型的标签而非链首重写", async () => {
+    const client = makeStubClient()
+    // 链首 vision-model 失败 → other-vision 成功产出并入库；命中缓存不再重调 prompt
+    client.setPromptBehavior((model) =>
+      model?.modelID === "vision-model"
+        ? { error: new Error("boom for vision") }
+        : { data: { parts: [{ type: "text", text: "a red square" }] } },
+    )
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model", "test/other-vision"],
+    } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const args = { image_path: persistedPath(), question: "same question" } as const
+    const signal = new AbortController().signal
+
+    const first = await analyze(args, toolCtx(signal))
+    // 首次：链首 vision-model 失败 + other-vision 成功 → 共 2 次 prompt
+    const promptsAfterFirst = client.calls.prompt.length
+    const second = await analyze(args, toolCtx(signal))
+
+    // 首次：other-vision 成功 → 标签标注实际产出的模型
+    expect(first.title).toBe("vision_analyze")
+    expect(first.output).toContain("described by test/other-vision")
+    // 命中：标签沿用入库模型 other-vision，而非被 format 误写成链首 vision-model
+    expect(second.title).toBe("vision_analyze (cached)")
+    expect(second.output).toContain("described by test/other-vision")
+    expect(second.output).toContain("a red square")
+    // 命中不再发起任何 prompt：第二次调用前后 prompt 计数保持不变
+    expect(client.calls.prompt.length).toBe(promptsAfterFirst)
+  })
+
   test("本地文件不存在或扩展名不受支持：返回可读错误文字", async () => {
     const client = makeStubClient()
     const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
