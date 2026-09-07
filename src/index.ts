@@ -9,24 +9,24 @@
  *
  * 安装方式一（npm）：
  *   {
- *     "plugin": [["opencode-vision-analyze", { "model": "provider/vision-model" }]]
+ *     "plugin": [["opencode-vision-analyze", { "models": ["provider/vision-model"] }]]
  *   }
  *
  * 安装方式二（curl 下载单文件，免 npm）：
  *   mkdir -p .opencode
  *   curl -fsSL <raw-url>/src/index.ts -o .opencode/vision-analyze.ts
  *   {
- *     "plugin": [["./.opencode/vision-analyze.ts", { "model": "provider/vision-model" }]]
+ *     "plugin": [["./.opencode/vision-analyze.ts", { "models": ["provider/vision-model"] }]]
  *   }
  *
  * 选项：
- *   - model（可选）：视觉模型的 "provider/model" 标识（单字符串，等价 models:["x"]）；与 models 互斥
- *   - models（可选）：有序视觉候选数组，如 ["provider-a/m1", "provider-b/m2"]；与 model 互斥
+ *   - models（可选，缺省/空数组 = 自动模式）：有序视觉候选数组，如
+ *     ["provider-a/m1", "provider-b/m2"]；单模型写 ["provider/model"] 即可
  *   - unlisted_fallback（可选，默认 false）：显式候选耗尽后自动续接未列出的 image-capable 模型
  *   - free_first（可选，默认 false）：自动发现档序反转（custom/匿名免费源优先，默认 config 优先）
  *   - timeout_ms：单候选子会话请求的超时毫秒数（正数，默认 60000）
  *
- * 候选链语义：显式 model/models 恒在链首；两者均缺 → 自动发现全部 image-capable
+ * 候选链语义：显式 models 恒在链首；缺省/空数组 → 自动发现全部 image-capable
  * 模型并按 Provider.source 档序排列。链上候选逐个尝试，成功即止，全败聚合报错。
  * 描述子会话的模型属于候选链，chat.message 递归防护以整链成员为集。
  *
@@ -106,23 +106,21 @@ const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
  */
 const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): Promise<Hooks> => {
   // ---- 选项解析与校验 ----------------------------------------------------
-  // 归一化规则：model 是单字符串（等价 models:["provider/model"]）；models 是有序候选
-  // 数组。二者并存视为冲突报错；两者均缺 → explicit 为空（进入自动发现，见 Task 3
-  // resolveChain）。model 由必填改为可选。
-  const modelOption = optionsArg?.model
+  // 归一化规则：models 是唯一显式入口 —— 有序候选数组（保序去重，重复只留首个）。
+  // 缺省或空数组 → explicit 为空（进入自动发现，见 resolveChain）。传了 models 但
+  // 类型不对（非字符串数组）直接抛错，避免用户配错被静默当成自动模式。
   const modelsOption = optionsArg?.models
-  const hasModel = typeof modelOption === "string" && modelOption.trim() !== ""
-  const hasModels = Array.isArray(modelsOption) && modelsOption.length > 0
-  if (hasModel && hasModels) {
-    throw new Error('opencode-vision-analyze options "model" and "models" are mutually exclusive')
+  if (optionsArg?.models !== undefined && !Array.isArray(modelsOption)) {
+    throw new Error('opencode-vision-analyze option "models" must be an array of "provider/model" strings')
   }
+  const hasModels = Array.isArray(modelsOption) && modelsOption.length > 0
   // 收集字符串候选并逐项校验 provider/model 格式（modelID 允许含 "/"，按首个 "/" 切分）。
-  // 逐项 throw：单 model 报 label "model"，数组报 "models[i]"；保序去重（重复只留首个）。
-  const raw = hasModel ? [modelOption as string] : hasModels ? (modelsOption as string[]) : []
+  // 逐项 throw：元素非法报 label "models[i]"；保序去重（重复只留首个）。
+  const raw = hasModels ? (modelsOption as string[]) : []
   const explicitModels: Array<{ providerID: string; modelID: string }> = []
   const seenKeys = new Set<string>()
   raw.forEach((item, index) => {
-    const label = hasModel ? "model" : `models[${index}]`
+    const label = `models[${index}]`
     if (typeof item !== "string" || !item.includes("/")) {
       throw new Error(
         `opencode-vision-analyze option "${label}" must be in "provider/model" format, got: ${JSON.stringify(item)}`,
@@ -280,7 +278,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       return {
         ok: false,
         error:
-          "no image-capable model configured (set the plugin model/models option or configure an image-capable provider model)",
+          "no image-capable model configured (set the plugin models option or configure an image-capable provider model)",
       }
     }
     return { ok: false, error: `all ${failures.length} candidate model(s) failed: ${failures.join("; ")}` }

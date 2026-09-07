@@ -84,20 +84,20 @@ describe("导出形状与选项校验", () => {
     expect(typeof mod.server).toBe("function")
   })
 
-  test("model 格式非法（缺 provider/model 斜杠）：抛错并提示格式", async () => {
+  test("models 含非法元素（缺 provider/model 斜杠）：抛错且信息含 models[0]", async () => {
     const client = makeStubClient()
     const input = makePluginInput(dir, client)
-    await expect(loadPlugin(input, { model: "no-slash" } as PluginOptions)).rejects.toThrow(
-      /option "model" must be in "provider\/model" format/,
+    await expect(loadPlugin(input, { models: ["no-slash"] } as PluginOptions)).rejects.toThrow(
+      /option "models\[0\]" must be in "provider\/model" format/,
     )
   })
 
-  test("model 与 models 并存：抛错（互斥）", async () => {
+  test("models 传了字符串而非数组：抛错并提示类型", async () => {
     const client = makeStubClient()
     const input = makePluginInput(dir, client)
-    await expect(
-      loadPlugin(input, { model: "test/vision-model", models: ["test/other-vision"] } as PluginOptions),
-    ).rejects.toThrow(/mutually exclusive/)
+    await expect(loadPlugin(input, { models: "test/vision-model" } as PluginOptions)).rejects.toThrow(
+      /option "models" must be an array of "provider\/model" strings/,
+    )
   })
 
   test("models 含非法元素：抛错且信息含 models[1]", async () => {
@@ -108,7 +108,7 @@ describe("导出形状与选项校验", () => {
     ).rejects.toThrow(/option "models\[1\]" must be in "provider\/model" format/)
   })
 
-  test("model 与 models 均缺：自动模式正常加载并返回 hooks", async () => {
+  test("models 缺省：自动模式正常加载并返回 hooks", async () => {
     const client = makeStubClient()
     const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions)
     expect(hooks["chat.message"]).toBeTypeOf("function")
@@ -116,20 +116,27 @@ describe("导出形状与选项校验", () => {
     expect(hooks.tool).toBeDefined()
   })
 
+  test("models 为空数组：同样视为自动模式正常加载", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: [] } as PluginOptions)
+    expect(hooks["chat.message"]).toBeTypeOf("function")
+    expect(hooks.tool).toBeDefined()
+  })
+
   test("宽容校验：unlisted_fallback / free_first 传非布尔按 false 处理，不抛错", async () => {
     const client = makeStubClient()
     const input = makePluginInput(dir, client)
     const loaded = await loadPlugin(input, {
-      model: "test/vision-model",
+      models: ["test/vision-model"],
       unlisted_fallback: "yes",
       free_first: 1,
     } as unknown as PluginOptions)
     expect(loaded.hooks["chat.message"]).toBeTypeOf("function")
   })
 
-  test("合法 model 选项正常加载并返回 hooks", async () => {
+  test("合法 models 选项正常加载并返回 hooks", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     expect(hooks["chat.message"]).toBeTypeOf("function")
     expect(hooks.dispose).toBeTypeOf("function")
   })
@@ -138,7 +145,7 @@ describe("导出形状与选项校验", () => {
 describe("chat.message 钩子", () => {
   test("无图片消息：不注入提示、不创建 vision 目录", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const out = chatOutput([{ type: "text", text: "hello" }])
     await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
     expect(out.parts.length).toBe(1)
@@ -147,7 +154,7 @@ describe("chat.message 钩子", () => {
 
   test("无视觉主模型带图：注入 synthetic 提示并落盘", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const out = chatOutput([imagePart()])
     await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
 
@@ -165,7 +172,7 @@ describe("chat.message 钩子", () => {
 
   test("有视觉主模型带图：不注入提示、不落盘（能力门控）", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const out = chatOutput([imagePart()])
     await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: OTHER_VISION_MODEL }), out)
     expect(out.parts.length).toBe(1)
@@ -174,7 +181,7 @@ describe("chat.message 钩子", () => {
 
   test("递归防护：主模型即视觉模型时不做任何处理", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const out = chatOutput([imagePart()])
     await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: VISION_MODEL }), out)
     expect(out.parts.length).toBe(1)
@@ -211,7 +218,7 @@ describe("chat.message 钩子", () => {
 
   test("能力查询结果进程级缓存：同模型两次消息只查一次", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     for (let i = 0; i < 2; i++) {
       const out = chatOutput([imagePart()])
       await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
@@ -223,7 +230,7 @@ describe("chat.message 钩子", () => {
 describe("vision_analyze 工具", () => {
   test("工具已注册且带描述与参数 schema", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const tool = (hooks.tool as Record<string, { description: string; args: Record<string, unknown> }>)["vision_analyze"]
     expect(tool).toBeDefined()
     expect(tool.description.length).toBeGreaterThan(0)
@@ -233,7 +240,7 @@ describe("vision_analyze 工具", () => {
 
   test("描述路径：创建子会话调用视觉模型并返回描述，子会话用后即删", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const analyze = getAnalyze(hooks)
 
     // 先落盘（供 loadImage 读取）
@@ -262,7 +269,7 @@ describe("vision_analyze 工具", () => {
 
   test("快速路径：会话主模型有视觉时直接回传原图附件，不调子会话", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
 
     // 先经 chat.message 记录会话模型为有视觉的 other-vision（同时不注入提示）
     const out = chatOutput([imagePart()])
@@ -285,7 +292,7 @@ describe("vision_analyze 工具", () => {
 
   test("描述缓存：同图同问题第二次直接命中，不再调用视觉模型", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const analyze = getAnalyze(hooks)
 
     await mkdir(path.dirname(persistedPath()), { recursive: true })
@@ -338,7 +345,7 @@ describe("vision_analyze 工具", () => {
 
   test("本地文件不存在或扩展名不受支持：返回可读错误文字", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const analyze = getAnalyze(hooks)
     const signal = new AbortController().signal
 
@@ -710,7 +717,7 @@ describe("URL 图片下载", () => {
 
   test("下载 http(s) 图片后走描述路径", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     let fetched = 0
     const restore = mockFetch((async () => {
       fetched += 1
@@ -734,7 +741,7 @@ describe("URL 图片下载", () => {
 
   test("404：返回下载失败文字，不创建子会话", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const restore = mockFetch((async () => new Response("nope", { status: 404 })) as typeof fetch)
     try {
       const result = await getAnalyze(hooks)(
@@ -750,7 +757,7 @@ describe("URL 图片下载", () => {
 
   test("超过 20MB（content-length 预检）：拒绝下载", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     // downloadImage 只使用 ok/status/headers.get/arrayBuffer，用最小 Response 形状即可确定性构造
     const fake = {
       ok: true,
@@ -772,7 +779,7 @@ describe("URL 图片下载", () => {
 
   test("不受支持的 URL 扩展名：不发起请求直接拒绝", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     let fetched = 0
     const restore = mockFetch((async () => {
       fetched += 1
@@ -792,7 +799,7 @@ describe("URL 图片下载", () => {
 
   test("网络异常：错误文字返回而非抛错", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const restore = mockFetch((async () => {
       throw new Error("network boom")
     }) as typeof fetch)
@@ -813,7 +820,7 @@ describe("超时 / 中止 / 容错", () => {
     const client = makeStubClient()
     client.setPromptBehavior(() => new Promise(() => {}))
     const { hooks } = await loadPlugin(makePluginInput(dir, client), {
-      model: "test/vision-model",
+      models: ["test/vision-model"],
       timeout_ms: 10,
     })
 
@@ -833,7 +840,7 @@ describe("超时 / 中止 / 容错", () => {
 
   test("预先中止的 signal：立即以 Aborted 结束", async () => {
     const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     await mkdir(path.dirname(persistedPath()), { recursive: true })
     await writeFile(persistedPath(), TINY_PNG)
 
@@ -849,7 +856,7 @@ describe("超时 / 中止 / 容错", () => {
     ;(client.session as { create: unknown }).create = async () => {
       throw new Error("create boom")
     }
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     await mkdir(path.dirname(persistedPath()), { recursive: true })
     await writeFile(persistedPath(), TINY_PNG)
 
@@ -866,7 +873,7 @@ describe("超时 / 中止 / 容错", () => {
     const client = makeStubClient()
     client.setPromptBehavior(() => new Promise(() => {}))
     const { hooks } = await loadPlugin(makePluginInput(dir, client), {
-      model: "test/vision-model",
+      models: ["test/vision-model"],
       timeout_ms: 60_000,
     })
 
