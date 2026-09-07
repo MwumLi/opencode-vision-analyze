@@ -1,5 +1,10 @@
 # opencode-vision-analyze 设计文档
 
+> 状态：定稿（2026-09-05，随 v0.1.0 初版发布）。
+> 关联实现文件：`src/index.ts`、`test/plugin.test.ts`、`test/helpers.ts`
+> 说明：本文档为插件基础架构设计快照；模型选择已演进为多模型候选链，见
+>   `docs/superpowers/specs/2026-09-07-model-chain-fallback-design.md`。
+
 > 本文档是插件的设计决策与机制说明存档，面向维护者。面向使用者的文档见 [README](../README.zh.md)。
 
 ## 目标

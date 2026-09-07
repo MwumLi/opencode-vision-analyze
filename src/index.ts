@@ -461,7 +461,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * free_first=true 时档序反转（custom 优先）。顺带预填 imageCapable 缓存
    * （与 imageSupport 同源，避免后续重复请求）。providers 查询瞬时失败返回空数组
    * 并记日志：显式链仍可用（fallback 追加部分静默跳过），自动模式退化为空链——
-   * 因 resolveChain 的 memoize，本次空链会持续整个进程（见 docs/DESIGN.md 已知限制）。
+   * 因 resolveChain 的 memoize，本次空链会持续整个进程（见 docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md 已知限制）。
    */
   const listImageCapableModels = async (): Promise<Array<{ providerID: string; modelID: string }>> => {
     try {

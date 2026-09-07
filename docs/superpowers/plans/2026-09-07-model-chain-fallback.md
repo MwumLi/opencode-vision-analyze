@@ -18,7 +18,7 @@
 | `src/index.ts` | 改 | 选项解析、resolveChain、链式描述、钩子、工具 |
 | `test/helpers.ts` | 改 | providers stub 带 source/多 provider/多模型；promptBehavior 收 model |
 | `test/plugin.test.ts` | 改 | 更新旧断言 + 新增链式/排序/空链/缓存用例 |
-| `docs/DESIGN.md`、`README.md`、`README.zh.md` | 改 | 同步新选项与行为 |
+| `docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md`、`README.md`、`README.zh.md` | 改 | 同步新选项与行为 |
 | `docs/superpowers/specs/2026-09-07-model-chain-fallback-design.md` | 改 | 定稿（去掉「草稿」状态行） |
 
 ---
@@ -271,7 +271,7 @@ const describeWithChain = async (
 
 ## Task 6：chat.message 递归防护 + 空链降级 + 文档
 
-**Files**: `src/index.ts` onChatMessage、`README.md`、`README.zh.md`、`docs/DESIGN.md`、spec 定稿
+**Files**: `src/index.ts` onChatMessage、`README.md`、`README.zh.md`、`docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md`、spec 定稿
 
 - [ ] Step 1: 失败测试：
   1. 递归防护：配置 `models:[A,B]`，消息模型 = B（非首候选）→ 不注入、不落盘。
@@ -305,7 +305,7 @@ const describeWithChain = async (
 - [ ] Step 3: `bun test` 全绿；`bun run typecheck`、`bun run build` 通过。
 - [ ] Step 4: 文档：
   - `README.md` / `README.zh.md`：选项表加 `models`、`unlisted_fallback`、`free_first`；`model` 标可选；移除「单模型无备选链」限制；补候选链示例与「发现排序（Provider.source 档序）+ zen free 免登录」说明。
-  - `docs/DESIGN.md`：新增决策行（候选链归一化/单一路径/fallback 构建期语义/发现排序按 source/free_first/缓存 modelId/空链降级）。
+  - `docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md`：新增决策行（候选链归一化/单一路径/fallback 构建期语义/发现排序按 source/free_first/缓存 modelId/空链降级）。
   - spec 顶部状态行改「定稿」。
 - [ ] Step 5: commit `feat: chain-wide recursion guard, empty-chain fallback, docs`
 

@@ -2,7 +2,7 @@
 
 > 状态：定稿（2026-09-07，实现完成并经议会验收）。
 > 关联实现文件：`src/index.ts`、`test/plugin.test.ts`、`test/helpers.ts`
-> 关联文档：`docs/DESIGN.md`、`README.md`、`README.zh.md`
+> 关联文档：`docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md`、`README.md`、`README.zh.md`
 
 ## 背景与目标
 
@@ -199,7 +199,7 @@ plugin.test.ts 新增：
 ## 文档更新
 
 - README.md / README.zh.md：选项表新增 `models`、`unlisted_fallback`、`free_first`；`model` 标为可选；移除「单模型无备选链」限制；补充候选链示例、发现排序（source 档序）与 zen free 免登录说明。
-- docs/DESIGN.md：新增决策行（候选链归一化 / 单一路径 / fallback 构建期语义 / 发现排序按 Provider.source / free_first 反转档序 / 缓存记录 modelId / 空链降级）。
+- docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md：新增决策行（候选链归一化 / 单一路径 / fallback 构建期语义 / 发现排序按 Provider.source / free_first 反转档序 / 缓存记录 modelId / 空链降级）。
 
 ## 验证门禁
 
