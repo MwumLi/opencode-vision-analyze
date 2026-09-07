@@ -182,6 +182,32 @@ describe("chat.message 钩子", () => {
     expect(client.calls.providers).toBe(0)
   })
 
+  test("整链递归防护：非链首候选（other-vision）的消息也不处理", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model", "test/other-vision"],
+    } as PluginOptions)
+    const out = chatOutput([imagePart()])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: OTHER_VISION_MODEL }), out)
+    expect(out.parts.length).toBe(1)
+    expect(await fileExists(persistedPath())).toBe(false)
+    // 防护集是整条候选链：非链首成员命中同样在能力查询之前返回，不触发 providers
+    expect(client.calls.providers).toBe(0)
+  })
+
+  test("空链降级：无 image-capable 模型时带图不注入提示、不落盘", async () => {
+    const client = makeStubClient()
+    client.setProvidersResult(providersStub(providerStub("test", "config", { "text-model": { image: false } })))
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions)
+    const out = chatOutput([imagePart()])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+    // 原图 part 原样保留，无 synthetic hint（交给核心 unsupportedParts 默认处理）
+    expect(out.parts.length).toBe(1)
+    expect(out.parts.some((p) => p["synthetic"] === true)).toBe(false)
+    // 空链不落盘：没有视觉模型可消费，落盘只是制造无人看的垃圾文件
+    expect(await fileExists(persistedPath())).toBe(false)
+  })
+
   test("能力查询结果进程级缓存：同模型两次消息只查一次", async () => {
     const client = makeStubClient()
     const { hooks } = await loadPlugin(makePluginInput(dir, client), { model: "test/vision-model" })
@@ -428,6 +454,56 @@ describe("vision 候选链 fallback（describeWithChain）", () => {
 
     expect(result.output).toContain("Image analysis failed: no image-capable model configured")
     expect(client.calls.create.length).toBe(0)
+  })
+})
+
+describe("自动发现排序（Provider.source 档序）", () => {
+  /** 提供 config 源（custom-gw/cfg-vision）与 custom 源（opencode/mimo-free）两个 image-capable 模型。 */
+  function dualSourceClient() {
+    const client = makeStubClient()
+    client.setProvidersResult(
+      providersStub(
+        providerStub("custom-gw", "config", { "cfg-vision": { image: true } }),
+        providerStub("opencode", "custom", { "mimo-free": { image: true } }),
+      ),
+    )
+    return client
+  }
+
+  test("默认档序：config 源视觉模型先于 custom 源（zen free）被尝试", async () => {
+    const client = dualSourceClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // config 源档位优先 → 首个尝试的是 custom-gw/cfg-vision，成功即止
+    expect(result.output).toContain("described by custom-gw/cfg-vision")
+    expect(client.calls.prompt[0]?.model).toEqual({ providerID: "custom-gw", modelID: "cfg-vision" })
+    expect(client.calls.prompt.length).toBe(1)
+  })
+
+  test("free_first 反转：custom 源（zen free）视觉模型先于 config 源被尝试", async () => {
+    const client = dualSourceClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { free_first: true } as PluginOptions)
+    const analyze = getAnalyze(hooks)
+
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await analyze(
+      { image_path: persistedPath(), question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+
+    // free_first=true 档序反转 → 首个尝试的是 custom 源的 opencode/mimo-free
+    expect(result.output).toContain("described by opencode/mimo-free")
+    expect(client.calls.prompt[0]?.model).toEqual({ providerID: "opencode", modelID: "mimo-free" })
+    expect(client.calls.prompt.length).toBe(1)
   })
 })
 

@@ -83,15 +83,39 @@ curl 方式说明：
 
 | 选项 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `model` | 是 | — | 视觉模型，`provider/model` 格式，如 `"anthropic/claude-sonnet-4-5"`、`"openai/gpt-4o-mini"` |
-| `timeout_ms` | 否 | `60000` | 视觉子会话请求超时（毫秒） |
+| `model` | 否 | — | 单个视觉模型，`provider/model` 格式，如 `"anthropic/claude-sonnet-4-5"`、`"openai/gpt-4o-mini"`。等价于 `models: ["..."]`；与 `models` 互斥。两者均缺时自动发现全部 image-capable 模型。 |
+| `models` | 否 | — | 有序候选视觉模型数组（`provider/model`），逐个尝试直到成功即止。与 `model` 互斥。 |
+| `unlisted_fallback` | 否 | `false` | 显式 `model`/`models` 链耗尽后，自动续试未列入清单的 image-capable 模型。 |
+| `free_first` | 否 | `false` | 自动发现时优先匿名/内置免费（`custom` 源）provider，置于 config 源之前——反转 source 档序。 |
+| `timeout_ms` | 否 | `60000` | 单候选尝试的超时预算（毫秒）；总最坏耗时 = N × `timeout_ms` |
+
+有序候选 + 自动续接 + 免费优先的配置示例：
+
+```jsonc
+// opencode.json
+{
+  "plugin": [
+    [
+      "opencode-vision-analyze",
+      {
+        "models": ["anthropic/claude-sonnet-4-5", "openai/gpt-4o-mini"],
+        "unlisted_fallback": true,
+        "free_first": true
+      }
+    ]
+  ]
+}
+```
 
 ## 工作原理
 
 ```
 用户贴图 + 提问
  └─ chat.message 钩子（消息持久化前）
+     ├─ 消息模型 ∈ 候选链 → 不做任何处理（递归防护）
      ├─ 主模型支持图片输入 → 不做任何处理（原图直发）
+     ├─ 无任何 image-capable 模型 → 不做处理（不注入 hint、不落盘；
+     │    交给核心对图片的默认处理）
      └─ 纯文本主模型 → 图片落盘 .opencode/vision/<sha256>.<ext>
         并注入 synthetic 提示（TUI 隐藏、模型可见）：
         "用 vision_analyze 工具查看，image_path: ..."
@@ -105,15 +129,19 @@ vision_analyze 工具：
  │    → 原图作为附件直接返回（不调视觉模型）
  ├─ http(s) 图片 URL → 下载（20 MB 上限）→ 统一磁盘路径
  ├─ 描述缓存命中（图片哈希 + 问题）→ 直接返回缓存文本
- └─ 子会话：parentID 挂当前会话、禁用全部工具、专用 system
-     prompt，图片 + 问题发给你的视觉模型
-     → 返回描述文字 → 子会话立即删除
+ │    （标签沿用产出该描述的模型）
+ └─ 候选链：沿链逐候选建子会话（parentID 挂当前会话、禁用全部工具、
+     专用 system prompt，图片 + 问题发给该候选视觉模型）
+     → 首个成功即返回 → 子会话删除
 ```
 
 关键行为：
 
 - **能力门控** —— 查询 `config.providers()` 能力字段，进程级缓存；有视觉能力的主模型永远不会收到提示或被路由。
-- **递归防护** —— 视觉模型自己的消息（来自子会话）不会被再次处理。
+- **候选链** —— 一个或多个视觉模型（`model`/`models`）按序逐个尝试直到成功。显式模型恒在链首；无显式配置时自动发现全部 image-capable 模型，按 provider 来源排序（config 最前 → env/api → custom/匿名；`free_first: true` 时反转）。`unlisted_fallback: true` 时显式链耗尽后会续试未列出的 image-capable 模型。
+- **递归防护（整链）** —— 候选链子会话发起的消息不会被再次处理。
+- **空链降级** —— 完全没有可用视觉模型时插件仍正常加载：贴图保持原样（不注入 hint），工具返回清晰错误而非路由。
+- **免登录免费模型** —— 自动发现与 `/models` 选择器同源（`config.providers()`），免登录也可发现的 zen free 视觉模型会进入候选链（其 provider 为 `custom` 源 → 默认最末档；`free_first: true` 可提到最前）。
 - **工具永不抛错** —— 所有失败都返回可读文字，agent 循环可以重试、换问题或告知用户。
 - **URL 图片** —— `image_path` 接受 `http(s)://...` 地址（需以受支持的图片扩展名结尾：png/jpg/jpeg/gif/webp）。
 
@@ -124,7 +152,6 @@ vision_analyze 工具：
 - **中止不传导** —— 用户中止不会取消进行中的下载/子会话请求，它们会跑到各自的 deadline（下载 30 秒、子会话 `timeout_ms`）。超时/中止后子会话虽被删除，但 provider 端的孤儿回合仍可能计费。
 - **历史图片** —— 插件启用之前发送的图片无法被描述（无提示、磁盘上无路径）。
 - **缓存无上限** —— 图片存储与描述缓存均不淘汰（进程级 / 项目目录级）。
-- **单模型无备选链** —— 只有一个显式 `model` 选项；失败时返回错误文字，不会尝试其他 provider。
 
 ## Roadmap
 

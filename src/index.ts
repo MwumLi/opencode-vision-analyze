@@ -20,8 +20,15 @@
  *   }
  *
  * 选项：
- *   - model（必填）：视觉模型的 "provider/model" 标识，例如 "anthropic/claude-sonnet-4-5"
- *   - timeout_ms：子会话请求的超时毫秒数（正数，默认 60000）
+ *   - model（可选）：视觉模型的 "provider/model" 标识（单字符串，等价 models:["x"]）；与 models 互斥
+ *   - models（可选）：有序视觉候选数组，如 ["provider-a/m1", "provider-b/m2"]；与 model 互斥
+ *   - unlisted_fallback（可选，默认 false）：显式候选耗尽后自动续接未列出的 image-capable 模型
+ *   - free_first（可选，默认 false）：自动发现档序反转（custom/匿名免费源优先，默认 config 优先）
+ *   - timeout_ms：单候选子会话请求的超时毫秒数（正数，默认 60000）
+ *
+ * 候选链语义：显式 model/models 恒在链首；两者均缺 → 自动发现全部 image-capable
+ * 模型并按 Provider.source 档序排列。链上候选逐个尝试，成功即止，全败聚合报错。
+ * 描述子会话的模型属于候选链，chat.message 递归防护以整链成员为集。
  *
  * 工作方式（vision_analyze 工具路径）：主模型调用 vision_analyze 时，插件
  * 创建一个 parentID 挂在当前会话下的临时子会话（不进会话列表、不生成
@@ -131,14 +138,6 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   // 二者按严格布尔取真，非布尔值宽容忽略按 false 处理（与下方 timeout_ms 的宽容校验一致）。
   const fallbackUnlisted = optionsArg?.unlisted_fallback === true
   const freeFirst = optionsArg?.free_first === true
-
-  // ---- onChatMessage 递归防护引用（Task 6 换整链防护前暂保留） ----------------
-  // describeImage 已在 Task 4 重构为 attemptModel/describeWithChain 逐候选尝试，
-  // 不再依赖下面两个常量；目前仅 onChatMessage 的递归防护仍按「显式链首候选」
-  // 判断（自动模式为占位空串即不拦截），待 Task 6 把防护集扩为整条候选链后移除。
-  const firstExplicit = explicitModels[0]
-  const visionProviderID = firstExplicit?.providerID ?? ""
-  const visionModelID = firstExplicit?.modelID ?? ""
 
   // 子会话请求的超时时间：timeout_ms 为正数时生效，默认 60 秒。
   const timeoutOption = optionsArg?.timeout_ms
@@ -520,11 +519,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * push 进去的 part 会一并入库）。
    *
    * 职责：
-   * 1. 递归防护——视觉模型自身的消息（例如子会话）不做任何处理；
-   * 2. 记录会话当前模型；
-   * 3. 收集图片 part，没有图片则直接返回；
+   * 1. 记录会话当前模型（先于递归防护：会话模型恰为视觉模型时也需记录）；
+   * 2. 收集图片 part，没有图片则直接返回；
+   * 3. 递归防护——消息模型 ∈ 候选链全体成员（我们的描述子会话）则放行；
    * 4. 能力门控——主模型本身能看图则不注入提示；
-   * 5. 图片落盘，并注入一条 synthetic text part 引导模型使用 vision_analyze。
+   * 5. 空链降级——没有任何可用视觉模型时不注入 hint；
+   * 6. 图片落盘，并注入一条 synthetic text part 引导模型使用 vision_analyze。
    */
   const onChatMessage: NonNullable<Hooks["chat.message"]> = async (hookInput, output) => {
     // 记录会话当前模型，供后续 vision_analyze 快速路径与未显式指定 model 的
@@ -533,19 +533,25 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     // 看不到该模型，会退化为子会话描述。
     if (hookInput.model) sessionModels.set(hookInput.sessionID, hookInput.model)
 
-    // 递归防护：视觉模型自身的 prompt（描述子会话）直接放行，
-    // 避免插件处理自己发起的消息造成循环。
-    if (hookInput.model?.providerID === visionProviderID && hookInput.model?.modelID === visionModelID) return
-
     // 只处理 base64 图片附件；没有图片就没有副作用。
     const images = output.parts.filter(
       (part): part is FilePart => part.type === "file" && part.mime.startsWith("image/"),
     )
     if (images.length === 0) return
 
+    // 递归防护：防护集 = 整条候选链（而非单模型/链首）。描述子会话用的模型是
+    // 链上任意候选，只要消息模型命中任一成员就放行，避免插件处理自己发起的
+    // 消息形成循环。resolveChain 懒加载 + memoize，只在首次触发一次 providers 查询。
+    if (hookInput.model && (await isCandidateModel(hookInput.model))) return
+
     // 能力门控：主模型有视觉能力时原图直发，不需要任何提示。
     const current = hookInput.model ?? sessionModels.get(hookInput.sessionID)
     if (current && (await imageSupport(current.providerID, current.modelID))) return
+
+    // 空链降级：没有任何可用视觉模型时不注入 hint、不落盘——落盘只会制造没有
+    // 视觉模型可消费的垃圾文件；交给核心 unsupportedParts 对图片 part 的默认处理。
+    const chain = await resolveChain()
+    if (chain.length === 0) return
 
     // 每张图落盘并生成两行提示；任何一张落盘失败就跳过该图（不影响其余图片）。
     const lines: string[] = []
