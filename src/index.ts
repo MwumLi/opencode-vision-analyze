@@ -377,6 +377,68 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     }
   }
 
+  /** Provider.source → 自动发现档位：config 最优先，env/api 次之，custom 与未知值最末 */
+  const tierOfSource = (source: string): number =>
+    source === "config" ? 0 : source === "env" || source === "api" ? 1 : 2
+
+  /** "provider/model" 引用键（与 imageCapable 缓存的键格式一致） */
+  const modelRefKey = (c: { providerID: string; modelID: string }): string => `${c.providerID}/${c.modelID}`
+
+  // 候选链 memoize：chat.message 钩子与 vision_analyze 工具共享一次 providers 查询
+  let chainPromise: Promise<Array<{ providerID: string; modelID: string }>> | undefined
+  /**
+   * 归一化产出最终候选链（统一数组，运行时只做逐个尝试）：
+   * - 显式非空：显式链恒在链首（不受 free_first/档序影响）；
+   *   unlisted_fallback=true 时再追加未列出的 image-capable 模型
+   * - 显式为空：整链 = 自动发现（全部 image-capable 模型，按 source 档序）
+   */
+  const resolveChain = (): Promise<Array<{ providerID: string; modelID: string }>> => {
+    chainPromise ??= (async () => {
+      // 自动模式：整链由自动发现决定
+      if (explicitModels.length === 0) return listImageCapableModels()
+      // 显式模式：默认只用显式链；unlisted_fallback=true 时追加 inventory 中未列出的模型
+      if (!fallbackUnlisted) return explicitModels
+      const inventory = await listImageCapableModels()
+      const explicitSet = new Set(explicitModels.map(modelRefKey))
+      return [...explicitModels, ...inventory.filter((c) => !explicitSet.has(modelRefKey(c)))]
+    })()
+    return chainPromise
+  }
+
+  /**
+   * 枚举 config.providers() 中全部 image-capable 模型，并按 Provider.source 档位
+   * 稳定排序（档内保持 providers 返回顺序）：默认 config > env/api > custom；
+   * free_first=true 时档序反转（custom 优先）。顺带预填 imageCapable 缓存
+   * （与 imageSupport 同源，避免后续重复请求）。providers 查询瞬时失败返回空数组：
+   * 显式链仍可用（fallback 追加部分静默跳过），自动模式退化为空链。
+   */
+  const listImageCapableModels = async (): Promise<Array<{ providerID: string; modelID: string }>> => {
+    try {
+      const result = await input.client.config.providers()
+      if (!result.data) return []
+      const found: Array<{ providerID: string; modelID: string; tier: number }> = []
+      for (const provider of result.data.providers ?? []) {
+        const tier = tierOfSource(provider.source)
+        for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+          if (model.capabilities?.input?.image !== true) continue
+          imageCapable.set(`${provider.id}/${modelID}`, true)
+          found.push({ providerID: provider.id, modelID, tier })
+        }
+      }
+      // 稳定排序：默认按档位升序（config 优先）；free_first 反转成降序（custom 优先）
+      found.sort((a, b) => (freeFirst ? b.tier - a.tier : a.tier - b.tier))
+      return found.map(({ providerID, modelID }) => ({ providerID, modelID }))
+    } catch {
+      return []
+    }
+  }
+
+  /** 判断某 model 是否为当前候选链成员（chat.message 递归防护用） */
+  const isCandidateModel = async (model: { providerID: string; modelID: string }): Promise<boolean> => {
+    const chain = await resolveChain()
+    return chain.some((c) => c.providerID === model.providerID && c.modelID === model.modelID)
+  }
+
   /**
    * 把一个图片 file part 落盘到 <directory>/.opencode/vision/<sha256>.<ext>。
    * 文件名用内容哈希，天然去重（同一张图多次发送只落一份）。
