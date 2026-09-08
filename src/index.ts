@@ -46,9 +46,11 @@
  * - SSRF 面：downloadImage 的 fetch 跟随重定向、不拦截私网/云元数据地址。
  *   本地单用户 CLI 的信任级别下可接受；生产多租户环境使用前应加私网
  *   地址拦截。
- * - 中止不传导：用户中止不会取消进行中的下载/子会话请求，最长空跑至
- *   各自的 deadline（下载 30 秒、子会话 timeout_ms）；超时/中止后子会话
- *   虽被删除，但 provider 端已发出的孤儿回合仍可能计入用量。
+ * - 中止传导不完整：子会话在超时/中止路径先 `session.abort` 再 delete（取消
+ *   provider 端孤儿回合）；已发出的 URL 下载仍跑满 30 秒 deadline，且 provider
+ *   若在 abort 落地前已计费，该回合仍可能计入用量。
+ * - 能力查询（config.providers()）带 5 秒超时保护：挂起不会永久 stall，
+ *   超时按查询失败降级（不缓存、可重试；自动模式空链按既有语义 memoize）。
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
  * - 图片存储按 git 语义分域：git 项目 → 项目 `.opencode/vision`；非 git 目录 →
