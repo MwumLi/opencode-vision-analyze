@@ -43,13 +43,8 @@
  * 类型依赖仅 @opencode-ai/plugin 与 @opencode-ai/sdk 的 type import。
  *
  * 已知限制：
- * - 能力查询（config.providers()）带 5 秒超时保护：挂起不会永久 stall，
- *   超时按查询失败降级（不缓存、可重试；自动模式空链按既有语义 memoize）。
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
- * - 图片存储按 git 语义分域：git 项目 → 项目 `.opencode/vision`；非 git 目录 →
- *   用户级缓存（每次落盘现算）。切换存储范围（如 git init）后旧会话 hint 的
- *   绝对路径 stale，重贴图即注入新 hint。详见 docs 2026-09-08 设计与 README。
  */
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
