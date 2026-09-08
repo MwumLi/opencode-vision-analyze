@@ -194,10 +194,6 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   const timeoutMs =
     typeof timeoutOption === "number" && Number.isFinite(timeoutOption) && timeoutOption > 0 ? timeoutOption : 60000
 
-  // 图片存储根：解析一次（git 项目 → 项目 .opencode/vision；非 git → 用户级缓存）。
-  // 下载与贴图落盘共用，见 resolveVisionDir 模块级注释。
-  const visionDir = resolveVisionDir(input.directory, process.env, process.platform, homedir())
-
   // ---- 闭包状态 ----------------------------------------------------------
   /** sessionID → 该会话最近一次 prompt 的模型（prompt 未显式指定 model 时回退使用） */
   const sessionModels = new Map<string, { providerID: string; modelID: string }>()
@@ -345,10 +341,32 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     `[Image: ${basename} — described by ${modelId}]\n${text}`
 
   /**
-   * 下载 http(s) URL 指向的图片并落盘到 <visionDir>/<sha256><ext>：
-   * 与 chat.message 落盘路径一致，内容哈希命名天然去重。
-   * 扩展名不受支持、HTTP 非 2xx、网络失败（含 30 秒下载超时）、超过
-   * 20 MB 下载上限（content-length 预检 + 读后复核）都返回 { error }，
+   * 把图片字节内容原子落盘并返回最终 filepath。每次调用现算存储根
+   * （git 项目 → 项目 .opencode/vision；非 git → 用户级缓存，见 resolveVisionDir）：
+   * 运行中存储范围变化（如 git init）从下一条图片起即时生效，无需重启。
+   * 先写 `<sha><ext>.tmp-<uuid>` 再 rename：共享目录（用户级/多实例）并发写同一 sha
+   * 时内容寻址下原子幂等；失败先清理临时文件再抛错，避免孤儿 tmp 累积。
+   */
+  const persistImageBytes = async (bytes: Buffer, ext: string): Promise<string> => {
+    const dir = resolveVisionDir(input.directory, process.env, process.platform, homedir())
+    const sha = createHash("sha256").update(bytes).digest("hex")
+    const filepath = path.join(dir, `${sha}${ext}`)
+    const tmpPath = path.join(dir, `${sha}${ext}.tmp-${randomUUID()}`)
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+    try {
+      await fs.writeFile(tmpPath, bytes)
+      await fs.rename(tmpPath, filepath)
+    } catch (error) {
+      await fs.unlink(tmpPath).catch(() => {})
+      throw error
+    }
+    return filepath
+  }
+
+  /**
+   * 下载 http(s) URL 指向的图片并落盘（内容哈希命名天然去重，写盘细节见
+   * persistImageBytes）。扩展名不受支持、HTTP 非 2xx、网络失败（含 30 秒下载
+   * 超时）、超过 20 MB 下载上限（content-length 预检 + 读后复核）都返回 { error }，
    * 由调用方转成可读的错误文字。
    */
   const downloadImage = async (url: string): Promise<{ filepath: string } | { error: string }> => {
@@ -370,14 +388,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       if (bytes.length > MAX_DOWNLOAD_BYTES) {
         return { error: "image exceeds 20 MB download limit" }
       }
-      const sha = createHash("sha256").update(bytes).digest("hex")
-      // 共享目录（用户级/多实例）下并发写同一 sha：先写临时文件再 rename，内容寻址下原子幂等。
-      await fs.mkdir(visionDir, { recursive: true, mode: 0o700 })
-      const filepath = path.join(visionDir, `${sha}${ext}`)
-      const tmpPath = path.join(visionDir, `${sha}${ext}.tmp-${randomUUID()}`)
-      await fs.writeFile(tmpPath, bytes)
-      await fs.rename(tmpPath, filepath)
-      return { filepath }
+      return { filepath: await persistImageBytes(bytes, ext) }
     } catch (error) {
       return { error: errText(error) }
     }
@@ -550,8 +561,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   }
 
   /**
-   * 把一个图片 file part 落盘到 <visionDir>/<sha256>.<ext>（visionDir 见 resolveVisionDir）。
-   * 文件名用内容哈希，天然去重（同一张图多次发送只落一份）。
+   * 把一个图片 file part 落盘（内容哈希命名去重，写盘细节见 persistImageBytes）。
    * 返回落盘信息；MIME 不受支持或 URL 不是 base64 data URL 时返回 undefined。
    */
   const persistImage = async (part: FilePart): Promise<{ filepath: string } | undefined> => {
@@ -561,14 +571,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     if (!match) return undefined
     try {
       const bytes = Buffer.from(match[2], "base64")
-      const sha = createHash("sha256").update(bytes).digest("hex")
-      // 与下载路径一致：先写临时文件再 rename，保证并发写同一 sha 时最终文件完整。
-      await fs.mkdir(visionDir, { recursive: true, mode: 0o700 })
-      const filepath = path.join(visionDir, `${sha}${ext}`)
-      const tmpPath = path.join(visionDir, `${sha}${ext}.tmp-${randomUUID()}`)
-      await fs.writeFile(tmpPath, bytes)
-      await fs.rename(tmpPath, filepath)
-      return { filepath }
+      return { filepath: await persistImageBytes(bytes, ext) }
     } catch {
       // fail-open 原则：图片落盘失败（EACCES/ENOSPC 等）只是少了 vision_analyze
       // 提示，不应让用户消息落库失败。返回 undefined，外层逐图跳过。

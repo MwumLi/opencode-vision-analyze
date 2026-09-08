@@ -1053,4 +1053,39 @@ describe("图片存储分域（git / 用户级）", () => {
     const files = await readdir(path.dirname(target))
     expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
   })
+
+  test("落盘失败路径：清理孤儿临时文件，fail-open 不注入 hint", async () => {
+    const noGit = await makeNoGitDir("vision-fail-")
+    const cacheRoot = await mkdtemp(path.join(tmpdir(), "vision-fail-cache-"))
+    const prev = process.env.XDG_CACHE_HOME
+    process.env.XDG_CACHE_HOME = cacheRoot
+    try {
+      const visionDir = path.join(cacheRoot, "opencode-vision-analyze", "vision")
+      // 目标同名目录已存在且非空 → rename(tmp, <sha>.png) 失败，触发 helper 的 tmp 清理。
+      const clash = path.join(visionDir, `${TINY_PNG_SHA}.png`)
+      await mkdir(clash, { recursive: true })
+      await writeFile(path.join(clash, "occupied"), "x")
+
+      const client = makeStubClient()
+      const input = makePluginInput(noGit, client)
+      const mod = (await import("../src/index")).default
+      const hooks = await mod.server(input, { models: ["test/vision-model"] })
+      const out = chatOutput([imagePart()])
+      await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+
+      // fail-open：消息不落库失败；未注入 hint；无 .tmp-* 孤儿残留。
+      const hints = out.parts.filter((p) => {
+        const t = p as { text?: string }
+        return typeof t.text === "string" && t.text.includes("vision_analyze")
+      })
+      expect(hints).toHaveLength(0)
+      const files = await readdir(visionDir)
+      expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CACHE_HOME
+      else process.env.XDG_CACHE_HOME = prev
+      await removeDir(noGit)
+      await removeDir(cacheRoot)
+    }
+  })
 })
