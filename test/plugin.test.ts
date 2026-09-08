@@ -32,7 +32,7 @@ import {
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
-import { isInsideGitRepo, resolveVisionDir, providersTimeout, resolveDescriptionDir, descriptionCacheLimits } from "../src/index"
+import { providersTimeout, resolveDescriptionDir, descriptionCacheLimits, visionCacheLimits, userVisionCacheRoot } from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
 let dir: string
@@ -87,8 +87,9 @@ function imagePart() {
   }
 }
 
-/** 预期落盘路径（内容寻址命名）。 */
-const persistedPath = () => path.join(dir, ".opencode", "vision", `${TINY_PNG_SHA}.png`)
+/** 预期图片落盘路径（用户级 vision 缓存目录，内容寻址命名）。 */
+const visionDir = () => path.join(cacheHome, "opencode-vision-analyze", "vision")
+const persistedPath = () => path.join(visionDir(), `${TINY_PNG_SHA}.png`)
 
 describe("导出形状与选项校验", () => {
   test("default 导出为 { id, server }，id 为包名", async () => {
@@ -156,13 +157,13 @@ describe("导出形状与选项校验", () => {
 })
 
 describe("chat.message 钩子", () => {
-  test("无图片消息：不注入提示、不创建 vision 目录", async () => {
+  test("无图片消息：不注入提示、不创建 vision 缓存目录", async () => {
     const client = makeStubClient()
     const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
     const out = chatOutput([{ type: "text", text: "hello" }])
     await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
     expect(out.parts.length).toBe(1)
-    expect(await fileExists(path.join(dir, ".opencode", "vision"))).toBe(false)
+    expect(await fileExists(visionDir())).toBe(false)
   })
 
   test("无视觉主模型带图：注入 synthetic 提示并落盘", async () => {
@@ -1056,146 +1057,94 @@ describe("超时 / 中止 / 容错", () => {
   })
 })
 
-describe("图片存储分域（git / 用户级）", () => {
-  /** 临时非 git 目录（不带 .git），用于触发「非 git → 用户级缓存」路径。 */
-  async function makeNoGitDir(prefix = "vision-no-git-"): Promise<string> {
-    const noGit = await mkdtemp(path.join(tmpdir(), prefix))
-    // 祖先（系统 tmpdir）不是 git repo；保险起见显式断言不含 .git
-    expect(isInsideGitRepo(noGit)).toBe(false)
-    return noGit
+describe("图片缓存（恒用户级目录 + LRU/容量）", () => {
+  /** 图片缓存目录：cacheHome/opencode-vision-analyze/vision（Linux，XDG_CACHE_HOME 已由 beforeEach 注入）。 */
+  /** 由种子构造长度固定、内容可判别的图片字节（扩展名 .png，仅供落盘/加载，不解析像素）。 */
+  function bytesOf(seed: number, size = 700): Buffer {
+    const b = Buffer.alloc(size)
+    for (let i = 0; i < size; i++) b[i] = (seed * 31 + i) % 251
+    return b
+  }
+  const shaOf = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex")
+  const imgPathOf = (bytes: Buffer) => path.join(visionDir(), `${shaOf(bytes)}.png`)
+  /** 构造给定字节的图片 file part（data URL，模拟贴图）。 */
+  function partOf(bytes: Buffer): Record<string, unknown> {
+    return {
+      id: `prt_${shaOf(bytes).slice(0, 12)}`,
+      sessionID: "ses_1",
+      messageID: "msg_1",
+      type: "file",
+      mime: "image/png",
+      url: `data:image/png;base64,${bytes.toString("base64")}`,
+      filename: "img.png",
+    }
+  }
+  /** 经 chat.message 钩子「贴」一张图（无视觉主模型 → 落盘 + 注入 hint），返回注入后的 hint。 */
+  async function paste(client: StubClient, hooks: LoadedPlugin["hooks"], bytes: Buffer): Promise<string> {
+    const out = chatOutput([partOf(bytes)])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+    const hint = out.parts[out.parts.length - 1] as { text?: string }
+    return hint.text ?? ""
+  }
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+  async function loadWithVision(): Promise<{ client: StubClient; hooks: LoadedPlugin["hooks"] }> {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    return { client, hooks }
   }
 
-  test("isInsideGitRepo：目录含 .git 目录 → true", async () => {
-    expect(isInsideGitRepo(dir)).toBe(true)
-  })
-
-  test("isInsideGitRepo：子目录向上命中父级 .git → true", async () => {
-    const sub = path.join(dir, "a", "b")
-    await mkdir(sub, { recursive: true })
-    expect(isInsideGitRepo(sub)).toBe(true)
-  })
-
-  test("isInsideGitRepo：.git 为文件（worktree）→ true", async () => {
-    const noGit = await makeNoGitDir()
-    try {
-      await writeFile(path.join(noGit, ".git"), "gitdir: /elsewhere/.git/worktrees/wt\n")
-      expect(isInsideGitRepo(noGit)).toBe(true)
-    } finally {
-      await removeDir(noGit)
-    }
-  })
-
-  test("isInsideGitRepo：深层子目录上溯命中祖先 .git 文件 → true", async () => {
-    const noGit = await makeNoGitDir()
-    try {
-      const sub = path.join(noGit, "a", "b", "c")
-      await mkdir(sub, { recursive: true })
-      await writeFile(path.join(noGit, ".git"), "gitdir: /elsewhere/.git/worktrees/wt\n")
-      expect(isInsideGitRepo(sub)).toBe(true) // 自 c 向上：c → b → a → 祖先(noGit) 的 .git 文件
-    } finally {
-      await removeDir(noGit)
-    }
-  })
-
-  test("isInsideGitRepo：无 .git 的目录（到根目录为止）→ false", async () => {
-    const noGit = await makeNoGitDir()
-    try {
-      expect(isInsideGitRepo(noGit)).toBe(false)
-      expect(isInsideGitRepo(path.parse(noGit).root)).toBe(false) // 根目录边界不抛错
-    } finally {
-      await removeDir(noGit)
-    }
-  })
-
-  test("resolveVisionDir：git 项目 → 项目内 .opencode/vision", async () => {
-    expect(resolveVisionDir(dir, process.env, process.platform, homedir())).toBe(
-      path.join(dir, ".opencode", "vision"),
+  test("userVisionCacheRoot：三平台默认 + env 覆盖 + 空串回退（恒用户级）", () => {
+    // Linux：默认 ~/.cache
+    expect(userVisionCacheRoot({}, "linux", "/home/u")).toBe(
+      path.join("/home/u", ".cache", "opencode-vision-analyze", "vision"),
+    )
+    // Linux + XDG_CACHE_HOME 覆盖
+    expect(userVisionCacheRoot({ XDG_CACHE_HOME: "/x/cache" }, "linux", "/home/u")).toBe(
+      path.join("/x/cache", "opencode-vision-analyze", "vision"),
+    )
+    // macOS：~/Library/Caches
+    expect(userVisionCacheRoot({}, "darwin", "/Users/u")).toBe(
+      path.join("/Users/u", "Library", "Caches", "opencode-vision-analyze", "vision"),
+    )
+    // macOS + XDG 覆盖（跨平台 dotfiles 宽容超集）
+    expect(userVisionCacheRoot({ XDG_CACHE_HOME: "/x/cache" }, "darwin", "/Users/u")).toBe(
+      path.join("/x/cache", "opencode-vision-analyze", "vision"),
+    )
+    // Windows：LOCALAPPDATA 覆盖 + 默认 ~/AppData/Local
+    expect(userVisionCacheRoot({ LOCALAPPDATA: "C:\\lapp" }, "win32", "C:\\Users\\u")).toBe(
+      path.join("C:\\lapp", "opencode-vision-analyze", "vision"),
+    )
+    expect(userVisionCacheRoot({}, "win32", "C:\\Users\\u")).toBe(
+      path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "vision"),
+    )
+    // 空串 env 视为未设置 → 回退默认
+    expect(userVisionCacheRoot({ XDG_CACHE_HOME: "" }, "linux", "/home/u")).toBe(
+      path.join("/home/u", ".cache", "opencode-vision-analyze", "vision"),
+    )
+    expect(userVisionCacheRoot({ LOCALAPPDATA: "" }, "win32", "C:\\Users\\u")).toBe(
+      path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "vision"),
+    )
+    // 与描述缓存同根同级：dirname 相等（两套缓存并列于 opencode-vision-analyze/ 下）
+    expect(path.dirname(userVisionCacheRoot({}, "linux", "/home/u"))).toBe(
+      path.dirname(resolveDescriptionDir({}, "linux", "/home/u")),
     )
   })
 
-  test("resolveVisionDir：非 git → 三平台用户缓存目录（含 env 覆盖）", async () => {
-    const noGit = await makeNoGitDir()
-    try {
-      // Linux 默认：~/.cache
-      expect(resolveVisionDir(noGit, {}, "linux", "/home/u")).toBe(
-        path.join("/home/u", ".cache", "opencode-vision-analyze", "vision"),
-      )
-      // Linux + XDG_CACHE_HOME 覆盖
-      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "/x/cache" }, "linux", "/home/u")).toBe(
-        path.join("/x/cache", "opencode-vision-analyze", "vision"),
-      )
-      // macOS：~/Library/Caches
-      expect(resolveVisionDir(noGit, {}, "darwin", "/Users/u")).toBe(
-        path.join("/Users/u", "Library", "Caches", "opencode-vision-analyze", "vision"),
-      )
-      // macOS + XDG_CACHE_HOME 覆盖（跨平台 dotfiles 宽容超集）
-      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "/x/cache" }, "darwin", "/Users/u")).toBe(
-        path.join("/x/cache", "opencode-vision-analyze", "vision"),
-      )
-      // Windows：%LOCALAPPDATA% 覆盖
-      expect(resolveVisionDir(noGit, { LOCALAPPDATA: "C:\\lapp" }, "win32", "C:\\Users\\u")).toBe(
-        path.join("C:\\lapp", "opencode-vision-analyze", "vision"),
-      )
-      // Windows：无 %LOCALAPPDATA% → 默认 ~/AppData/Local
-      expect(resolveVisionDir(noGit, {}, "win32", "C:\\Users\\u")).toBe(
-        path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "vision"),
-      )
-    } finally {
-      await removeDir(noGit)
-    }
-  })
-
-  test("resolveVisionDir：缓存根 env 为空串 → 视为未设置、回退默认平台路径", async () => {
-    const noGit = await makeNoGitDir()
-    try {
-      // Linux：XDG_CACHE_HOME="" → ~/.cache（空串不得产出相对路径）
-      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "" }, "linux", "/home/u")).toBe(
-        path.join("/home/u", ".cache", "opencode-vision-analyze", "vision"),
-      )
-      // macOS：XDG_CACHE_HOME="" → ~/Library/Caches
-      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "" }, "darwin", "/Users/u")).toBe(
-        path.join("/Users/u", "Library", "Caches", "opencode-vision-analyze", "vision"),
-      )
-      // Windows：LOCALAPPDATA="" → ~/AppData/Local
-      expect(resolveVisionDir(noGit, { LOCALAPPDATA: "" }, "win32", "C:\\Users\\u")).toBe(
-        path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "vision"),
-      )
-    } finally {
-      await removeDir(noGit)
-    }
-  })
-
-  test("端到端：非 git 目录贴图 → 落在用户级缓存目录，hint 指向该处", async () => {
-    const noGit = await makeNoGitDir("vision-no-git-e2e-")
-    const cacheRoot = await mkdtemp(path.join(tmpdir(), "vision-cache-"))
-    const prev = process.env.XDG_CACHE_HOME
-    process.env.XDG_CACHE_HOME = cacheRoot
-    try {
-      const client = makeStubClient()
-      const input = makePluginInput(noGit, client)
-      const mod = (await import("../src/index")).default
-      const hooks = await mod.server(input, { models: ["test/vision-model"] })
-      const out = chatOutput([imagePart()])
-      await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
-
-      const hint = out.parts[out.parts.length - 1] as { text?: string }
-      expect(hint.text).toContain("vision_analyze")
-      const match = /image_path: ([^\]]+)/.exec(hint.text ?? "")
-      expect(match?.[1]).toBe(path.join(cacheRoot, "opencode-vision-analyze", "vision", `${TINY_PNG_SHA}.png`))
-      expect(await fileExists(match?.[1] ?? "")).toBe(true)
-    } finally {
-      if (prev === undefined) delete process.env.XDG_CACHE_HOME
-      else process.env.XDG_CACHE_HOME = prev
-      await removeDir(noGit)
-      await removeDir(cacheRoot)
-    }
+  test("端到端（git 项目目录）：贴图落用户级 vision 目录，项目目录零污染", async () => {
+    // 显式模拟 git 项目（.git 目录），证明图片存储与 git 判定解耦、不再写项目内
+    await mkdir(path.join(dir, ".git"))
+    const { client, hooks } = await loadWithVision()
+    const hint = await paste(client, hooks, TINY_PNG)
+    expect(hint).toContain("vision_analyze")
+    expect(hint).toContain(`image_path: ${persistedPath()}`)
+    expect(await fileExists(persistedPath())).toBe(true)
+    // 项目目录零污染：不产生任何 .opencode 运行时产物
+    expect(await fileExists(path.join(dir, ".opencode"))).toBe(false)
   })
 
   test("并发写同一 sha：最终文件字节完整、无残留临时文件", async () => {
-    const client = makeStubClient()
-    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
-
-    const images = [imagePart(), imagePart()] // 同字节同 sha
+    const { client, hooks } = await loadWithVision()
+    const images = [partOf(TINY_PNG), partOf(TINY_PNG)] // 同字节同 sha
     const outA = chatOutput([images[0]])
     const outB = chatOutput([images[1]])
     const hook = hooks["chat.message"]
@@ -1204,46 +1153,147 @@ describe("图片存储分域（git / 用户级）", () => {
       hook(chatInput({ sessionID: "ses_b", model: MAIN_MODEL }), outB),
     ])
 
-    const target = path.join(dir, ".opencode", "vision", `${TINY_PNG_SHA}.png`)
-    const bytes = await import("node:fs/promises").then((m) => m.readFile(target))
+    const bytes = await readFile(persistedPath())
     expect(bytes.equals(TINY_PNG)).toBe(true)
-    const files = await readdir(path.dirname(target))
+    const files = await readdir(visionDir())
     expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
   })
 
   test("落盘失败路径：清理孤儿临时文件，fail-open 不注入 hint", async () => {
-    const noGit = await makeNoGitDir("vision-fail-")
-    const cacheRoot = await mkdtemp(path.join(tmpdir(), "vision-fail-cache-"))
-    const prev = process.env.XDG_CACHE_HOME
-    process.env.XDG_CACHE_HOME = cacheRoot
+    // 目标同名目录已存在且非空 → rename(tmp, <sha>.png) 失败，触发 helper 的 tmp 清理。
+    const clash = persistedPath()
+    await mkdir(clash, { recursive: true })
+    await writeFile(path.join(clash, "occupied"), "x")
+
+    const { client, hooks } = await loadWithVision()
+    const hint = await paste(client, hooks, TINY_PNG)
+    // fail-open：消息不落库失败；未注入 hint；无 .tmp-* 孤儿残留。
+    expect(hint).toBe("")
+    const files = await readdir(visionDir())
+    expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
+  })
+
+  test("LRU 条目上限：maxEntries=2 贴 3 张不同图 → 最旧被淘汰，目录只剩 2", async () => {
+    const saved = { ...visionCacheLimits }
+    visionCacheLimits.maxEntries = 2
+    visionCacheLimits.maxBytes = 500 * 1024 * 1024 // 条目维度隔离：字节上限放大
+    const { client, hooks } = await loadWithVision()
     try {
-      const visionDir = path.join(cacheRoot, "opencode-vision-analyze", "vision")
-      // 目标同名目录已存在且非空 → rename(tmp, <sha>.png) 失败，触发 helper 的 tmp 清理。
-      const clash = path.join(visionDir, `${TINY_PNG_SHA}.png`)
-      await mkdir(clash, { recursive: true })
-      await writeFile(path.join(clash, "occupied"), "x")
-
-      const client = makeStubClient()
-      const input = makePluginInput(noGit, client)
-      const mod = (await import("../src/index")).default
-      const hooks = await mod.server(input, { models: ["test/vision-model"] })
-      const out = chatOutput([imagePart()])
-      await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
-
-      // fail-open：消息不落库失败；未注入 hint；无 .tmp-* 孤儿残留。
-      const hints = out.parts.filter((p) => {
-        const t = p as { text?: string }
-        return typeof t.text === "string" && t.text.includes("vision_analyze")
-      })
-      expect(hints).toHaveLength(0)
-      const files = await readdir(visionDir)
-      expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
+      const a = bytesOf(1)
+      const b = bytesOf(2)
+      const c = bytesOf(3)
+      for (const img of [a, b, c]) {
+        await paste(client, hooks, img)
+        await sleep(10) // 拉开 mtime，保证淘汰顺序可判
+      }
+      // 容量：目录只剩 2 张（最早写入的 a 被逐出）
+      const files = (await readdir(visionDir())).filter((f) => f.endsWith(".png"))
+      expect(files.length).toBe(2)
+      expect(await fileExists(imgPathOf(a))).toBe(false)
+      expect(await fileExists(imgPathOf(b))).toBe(true)
+      expect(await fileExists(imgPathOf(c))).toBe(true)
     } finally {
-      if (prev === undefined) delete process.env.XDG_CACHE_HOME
-      else process.env.XDG_CACHE_HOME = prev
-      await removeDir(noGit)
-      await removeDir(cacheRoot)
+      visionCacheLimits.maxEntries = saved.maxEntries
+      visionCacheLimits.maxBytes = saved.maxBytes
     }
+  })
+
+  test("LRU 字节上限：maxBytes=1500 贴 3 张（各 700B）→ 淘汰最旧至总字节 ≤ 1500", async () => {
+    const saved = { ...visionCacheLimits }
+    visionCacheLimits.maxEntries = 2000
+    visionCacheLimits.maxBytes = 1500
+    const { client, hooks } = await loadWithVision()
+    try {
+      const a = bytesOf(1)
+      const b = bytesOf(2)
+      const c = bytesOf(3)
+      for (const img of [a, b, c]) {
+        await paste(client, hooks, img)
+        await sleep(10)
+      }
+      // 3×700=2100 > 1500 → 淘汰 1 条 → 2×700=1400 ≤ 1500
+      const files = (await readdir(visionDir())).filter((f) => f.endsWith(".png"))
+      expect(files.length).toBe(2)
+      const total = (
+        await Promise.all(files.map(async (f) => (await stat(path.join(visionDir(), f))).size)),
+      ).reduce((x, y) => x + y, 0)
+      expect(total).toBeLessThanOrEqual(1500)
+      expect(await fileExists(imgPathOf(a))).toBe(false)
+      expect(await fileExists(imgPathOf(b))).toBe(true)
+      expect(await fileExists(imgPathOf(c))).toBe(true)
+    } finally {
+      visionCacheLimits.maxEntries = saved.maxEntries
+      visionCacheLimits.maxBytes = saved.maxBytes
+    }
+  })
+
+  test("单图超限：maxBytes=100 贴 300B 图 → 仍落盘且当次不被自删，下一次写入才收敛", async () => {
+    const saved = { ...visionCacheLimits }
+    visionCacheLimits.maxEntries = 2000
+    visionCacheLimits.maxBytes = 100
+    const { client, hooks } = await loadWithVision()
+    try {
+      const big = bytesOf(9, 300)
+      // 单图 > maxBytes：稳定 image_path 必需 → 允许落盘；protect 保证当次不被自己的淘汰删除
+      await paste(client, hooks, big)
+      expect(await fileExists(imgPathOf(big))).toBe(true)
+
+      // 下一次无关写入（TINY_PNG 68B）触发淘汰 → 超限巨图成为最旧被收敛，新图保留
+      await sleep(10)
+      await paste(client, hooks, TINY_PNG)
+      expect(await fileExists(imgPathOf(big))).toBe(false)
+      expect(await fileExists(persistedPath())).toBe(true)
+    } finally {
+      visionCacheLimits.maxEntries = saved.maxEntries
+      visionCacheLimits.maxBytes = saved.maxBytes
+    }
+  })
+
+  test("LRU touch：命中缓存内旧图延寿（touch 后不再是淘汰对象）", async () => {
+    const saved = { ...visionCacheLimits }
+    visionCacheLimits.maxEntries = 2
+    visionCacheLimits.maxBytes = 500 * 1024 * 1024
+    const { client, hooks } = await loadWithVision()
+    try {
+      const a = bytesOf(1)
+      const b = bytesOf(2)
+      await paste(client, hooks, a)
+      await sleep(10)
+      await paste(client, hooks, b)
+      await sleep(10)
+
+      // 经工具命中 a（vision 缓存根内）→ loadImage touch a → a 成为最新，b 反而最旧
+      const r = await getAnalyze(hooks)(
+        { image_path: imgPathOf(a), question: "look" },
+        toolCtx(new AbortController().signal),
+      )
+      expect(r.title).toBe("vision_analyze")
+      await sleep(10)
+
+      // 再写一张 c → 淘汰最旧：应淘汰 b（未被 touch），a 因 touch 延寿保留
+      await paste(client, hooks, bytesOf(3))
+      expect(await fileExists(imgPathOf(a))).toBe(true)
+      expect(await fileExists(imgPathOf(b))).toBe(false)
+    } finally {
+      visionCacheLimits.maxEntries = saved.maxEntries
+      visionCacheLimits.maxBytes = saved.maxBytes
+    }
+  })
+
+  test("流程 B 外部本地文件：原位读取、绝不 touch（mtime 不变）", async () => {
+    const ext = path.join(dir, "external.png")
+    await writeFile(ext, TINY_PNG)
+    const before = await stat(ext)
+    const { hooks } = await loadWithVision()
+    const r = await getAnalyze(hooks)(
+      { image_path: ext, question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(r.output).toContain("a red square")
+    const after = await stat(ext)
+    expect(after.mtimeMs).toBe(before.mtimeMs)
+    // 且未在 vision 缓存目录产生任何复制
+    expect(await fileExists(persistedPath())).toBe(false)
   })
 })
 

@@ -36,6 +36,3 @@ desktop.ini
 # 测试覆盖率
 coverage/
 .nyc_output/
-
-# 插件运行时产物（opencode-vision-analyze 落盘的图片）
-.opencode/vision/
