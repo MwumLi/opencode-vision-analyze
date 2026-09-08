@@ -6,8 +6,6 @@
 >   `docs/superpowers/specs/2026-09-07-model-chain-fallback-design.md`。
 >   2026-09-08 起视觉模型配置入口收敛为唯一 `models: string[]`（`model` 已移除），
 >   以演进 spec 的「变更记录」为准；本快照中相关旧表述不构成当前行为。
->   2026-09-08 另：图片存储改为按 git 语义自动分域（见下方「落盘」决策行与
->   `docs/superpowers/specs/2026-09-08-git-scoped-image-store-design.md`）。
 
 > 本文档是插件的设计决策与机制说明存档，面向维护者。面向使用者的文档见 [README](../README.zh.md)。
 
@@ -32,7 +30,7 @@
 | fallback 构建期语义 | `unlisted_fallback` 是纯构建期开关：只在 `resolveChain()` 组装链时消费（显式链 ++ 未列出的 image-capable 模型），链定型后执行零分支 |
 | 发现排序 | 自动/fallback 部分按 `Provider.source` 档位稳定排序（档内保持 `config.providers()` 返回顺序；source 缺失/未知归档3）：默认 `config > env/api > custom`；`free_first=true` 时档序整体反转（custom/匿名免费优先） |
 | 失败语义 | 候选失败/超时/中止 → 聚合可读错误文字（工具永不 throw），原图仍由核心 unsupportedParts 机制降级 |
-| 落盘 | 按 git 语义自动分域（2026-09-08 变更）：git 项目内 → `<项目>/.opencode/vision`；非 git 目录 → 用户级缓存 `<cache>/opencode-vision-analyze/vision`。文件名 `<sha256>.<ext>` 内容寻址，跨会话/跨目录天然去重；共享目录并发写同 sha 用临时文件 + rename 原子替换。详见 `2026-09-08-git-scoped-image-store-design.md` |
+| 落盘 | `.opencode/vision/<sha256>.<ext>` 内容寻址，跨会话天然去重 |
 | 缓存记录 modelId | 描述缓存键 `<图片sha256>:<问题>`、值 `{ modelId, text }`：命中标签沿用入库时的 modelId，不随当前候选链链首变化而重写 |
 | 递归防护（整链） | 防护集 = 候选链全体成员：描述子会话使用的任意候选模型的消息（prompt）都不再处理，不注入、不落盘 |
 | 空链降级 | 显式/自动均无 image-capable → 插件正常加载（自动模式）；`vision_analyze` 返回友好错误、不建子会话；chat.message 带图不注入 hint、不落盘（避免制造无人消费的落盘文件） |
