@@ -818,6 +818,64 @@ describe("URL 图片下载", () => {
       restore()
     }
   })
+
+  test("中止传导：pre-abort → 不发起 URL 下载", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    let fetched = 0
+    const restore = mockFetch((async () => {
+      fetched += 1
+      return new Response(TINY_PNG)
+    }) as typeof fetch)
+    try {
+      const controller = new AbortController()
+      controller.abort()
+      const result = await getAnalyze(hooks)(
+        { image_path: "http://example.com/pic.png", question: "x" },
+        toolCtx(controller.signal),
+      )
+      // 已中止则根本不发请求；下载失败文字透传 Aborted
+      expect(fetched).toBe(0)
+      expect(result.output).toContain("Image download failed: Aborted")
+    } finally {
+      restore()
+    }
+  })
+
+  test("中止传导：下载进行中 abort → 立即中断请求", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    let fetchSignal: AbortSignal | undefined
+    const restore = mockFetch(((_, init) => {
+      fetchSignal = init?.signal ?? undefined
+      return new Promise<Response>((_resolve, reject) => {
+        fetchSignal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        )
+      })
+    }) as typeof fetch)
+    try {
+      const controller = new AbortController()
+      const pending = getAnalyze(hooks)(
+        { image_path: "http://example.com/pic.png", question: "x" },
+        toolCtx(controller.signal),
+      )
+      // 等 fetch 已被调用、signal 已传入下载请求
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(fetchSignal).toBeDefined()
+      controller.abort()
+      const result = await pending
+
+      // abort 传导到下载请求：signal 已中止、结果透传 Aborted、不建子会话
+      expect(fetchSignal?.aborted).toBe(true)
+      expect(result.output).toContain("Image download failed: Aborted")
+      expect(client.calls.create.length).toBe(0)
+    } finally {
+      restore()
+    }
+  })
 })
 
 describe("超时 / 中止 / 容错", () => {

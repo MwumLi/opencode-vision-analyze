@@ -46,9 +46,9 @@
  * - SSRF 面：downloadImage 的 fetch 跟随重定向、不拦截私网/云元数据地址。
  *   本地单用户 CLI 的信任级别下可接受；生产多租户环境使用前应加私网
  *   地址拦截。
- * - 中止传导不完整：子会话在超时/中止路径先 `session.abort` 再 delete（取消
- *   provider 端孤儿回合）；已发出的 URL 下载仍跑满 30 秒 deadline，且 provider
- *   若在 abort 落地前已计费，该回合仍可能计入用量。
+ * - 中止计费竞态：子会话在超时/中止路径先 `session.abort` 再 delete（取消
+ *   provider 端孤儿回合），进行中的 URL 下载也会被立即取消；provider 若在
+ *   abort 落地前已计费，该回合仍可能计入用量（已服务 token 不可退）。
  * - 能力查询（config.providers()）带 5 秒超时保护：挂起不会永久 stall，
  *   超时按查询失败降级（不缓存、可重试；自动模式空链按既有语义 memoize）。
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
@@ -421,8 +421,17 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * persistImageBytes）。扩展名不受支持、HTTP 非 2xx、网络失败（含 30 秒下载
    * 超时）、超过 20 MB 下载上限（content-length 预检 + 读后复核）都返回 { error }，
    * 由调用方转成可读的错误文字。
+   *
+   * 中止传导：abort（用户中止）与 30 秒超时共同驱动一个 AbortController——
+   * 中止即刻断请求，不空跑满超时；pre-abort 直接放弃、不发请求。手动组合信号
+   * 而非 AbortSignal.any()：engines node>=18（any 需 18.17+/20.3+），且与
+   * withDeadline 的 addEventListener 风格同构。错误以 AbortError/超时形式落入
+   * catch，统一转可读文字。
    */
-  const downloadImage = async (url: string): Promise<{ filepath: string } | { error: string }> => {
+  const downloadImage = async (
+    url: string,
+    abort: AbortSignal,
+  ): Promise<{ filepath: string } | { error: string }> => {
     try {
       // URL 解析与扩展名提取放在 try 内：畸形 URL 在 new URL 处抛错时，
       // 错误以 "Image download failed" 前缀返回，而不是漏到外层的
@@ -430,18 +439,32 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       const ext = path.extname(new URL(url).pathname).toLowerCase()
       const mime = EXT_MIME[ext]
       if (!mime) return { error: `unsupported image URL extension: ${ext || "(none)"}` }
-      const response = await fetch(url, { signal: AbortSignal.timeout(30_000) })
-      if (!response.ok) return { error: `HTTP ${response.status}` }
-      // 头字段缺失时 Number(null) 为 NaN，比较结果为 false，自然放行到读后复核。
-      if (Number(response.headers.get("content-length")) > MAX_DOWNLOAD_BYTES) {
-        return { error: "image exceeds 20 MB download limit" }
+      // pre-abort：已中止则不必发请求，直接以 Aborted 收尾
+      if (abort.aborted) return { error: "Aborted" }
+
+      const controller = new AbortController()
+      const onAbort = () => controller.abort()
+      abort.addEventListener("abort", onAbort, { once: true })
+      const timer = setTimeout(() => controller.abort(), 30_000)
+      try {
+        // 整个下载（fetch 响应头 + arrayBuffer 读 body）都在同一 guard 内：
+        // 30 秒预算与用户中止都覆盖到 body 读取阶段；收尾再清 timer/listener。
+        const response = await fetch(url, { signal: controller.signal })
+        if (!response.ok) return { error: `HTTP ${response.status}` }
+        // 头字段缺失时 Number(null) 为 NaN，比较结果为 false，自然放行到读后复核。
+        if (Number(response.headers.get("content-length")) > MAX_DOWNLOAD_BYTES) {
+          return { error: "image exceeds 20 MB download limit" }
+        }
+        const bytes = Buffer.from(await response.arrayBuffer())
+        // 复核实际字节数：chunked 等无 content-length 的响应只有读后才能判大小。
+        if (bytes.length > MAX_DOWNLOAD_BYTES) {
+          return { error: "image exceeds 20 MB download limit" }
+        }
+        return { filepath: await persistImageBytes(bytes, ext) }
+      } finally {
+        clearTimeout(timer)
+        abort.removeEventListener("abort", onAbort)
       }
-      const bytes = Buffer.from(await response.arrayBuffer())
-      // 复核实际字节数：chunked 等无 content-length 的响应只有读后才能判大小。
-      if (bytes.length > MAX_DOWNLOAD_BYTES) {
-        return { error: "image exceeds 20 MB download limit" }
-      }
-      return { filepath: await persistImageBytes(bytes, ext) }
     } catch (error) {
       return { error: errText(error) }
     }
@@ -475,7 +498,10 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     try {
       const question = args.question?.trim() || "Describe this image in full detail."
       // http(s) URL：先下载到本地 vision 目录，再统一走磁盘加载路径。
-      const download = /^https?:\/\//i.test(args.image_path) ? await downloadImage(args.image_path) : undefined
+      // ctx.abort 传入下载：用户中止即刻断下载（含 pre-abort 不再发请求）。
+      const download = /^https?:\/\//i.test(args.image_path)
+        ? await downloadImage(args.image_path, ctx.abort)
+        : undefined
       if (download && "error" in download) {
         return { title, output: `Image download failed: ${download.error}` }
       }
