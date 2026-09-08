@@ -447,6 +447,9 @@ describe("vision 候选链 fallback（describeWithChain）", () => {
     // 只尝试了首候选一次，没有推进 other-vision
     expect(client.calls.prompt.length).toBe(1)
     expect(client.calls.create.length).toBe(1)
+    // R2：运行中用户 abort → 先 abort 再删除该子会话
+    expect(client.calls.aborted).toEqual(["ses_sub_1"])
+    expect(client.calls.deleted).toContain("ses_sub_1")
   })
 
   test("空链：无 image-capable 模型时返回友好错误且不建子会话", async () => {
@@ -875,6 +878,54 @@ describe("超时 / 中止 / 容错", () => {
     expect(result.output).toContain("vision model call timed out after 10ms")
     // 超时路径的 finally 仍会删除子会话
     expect(client.calls.deleted).toContain("ses_sub_1")
+  })
+
+  test("R2：超时路径先 abort 子会话再 delete（取消孤儿回合）", async () => {
+    const client = makeStubClient()
+    client.setPromptBehavior(() => new Promise(() => {}))
+    // 本地记录 abort/delete 的先后顺序（stub 默认实现只分别入列，无法跨数组断言顺序）
+    const order: string[] = []
+    const rawAbort = client.session.abort.bind(client.session)
+    const rawDelete = client.session.delete.bind(client.session)
+    client.session.abort = async (args: { path: { id: string } }) => {
+      order.push(`abort:${args.path.id}`)
+      return rawAbort(args)
+    }
+    client.session.delete = async (args: { path: { id: string } }) => {
+      order.push(`delete:${args.path.id}`)
+      return rawDelete(args)
+    }
+
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model"],
+      timeout_ms: 10,
+    })
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await getAnalyze(hooks)(
+      { image_path: persistedPath(), question: "x" },
+      toolCtx(new AbortController().signal),
+    )
+
+    expect(result.output).toContain("vision model call timed out after 10ms")
+    expect(client.calls.aborted).toContain("ses_sub_1")
+    expect(client.calls.deleted).toContain("ses_sub_1")
+    expect(order).toEqual(["abort:ses_sub_1", "delete:ses_sub_1"])
+  })
+
+  test("R2：成功路径不 abort 子会话", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+
+    const result = await getAnalyze(hooks)(
+      { image_path: persistedPath(), question: "x" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(result.output).toContain("described by test/vision-model")
+    expect(client.calls.deleted).toContain("ses_sub_1")
+    expect(client.calls.aborted).toHaveLength(0)
   })
 
   test("预先中止的 signal：立即以 Aborted 结束", async () => {

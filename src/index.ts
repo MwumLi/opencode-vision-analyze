@@ -256,30 +256,32 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
 
   /**
    * 给子会话请求加超时与 abort 保护：任一触发即让 Promise 以错误结束，
-   * 不再等待底层请求；finally 中清理 timer 与监听器，避免泄漏。
+   * 不再等待底层请求；超时复用 withTimeout（DeadlineError），abort 仍以
+   * AbortError 拒绝；finally 中清理 timer 与监听器，避免泄漏。
    */
   const withDeadline = <T>(promise: Promise<T>, ctx: ToolContext): Promise<T> => {
-    let timer: ReturnType<typeof setTimeout> | undefined
+    // ctx.abort 已中止时 abort 事件不会再触发，必须立即拒绝，
+    // 否则 race 只能干等 timer 超时。
+    if (ctx.abort.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"))
     let onAbort: (() => void) | undefined
-    const guarded = new Promise<never>((_, reject) => {
-      // ctx.abort 已中止时 abort 事件不会再触发，必须立即拒绝，
-      // 否则 race 只能干等 timer 超时。
-      if (ctx.abort.aborted) {
-        reject(new DOMException("Aborted", "AbortError"))
-        return
-      }
-      timer = setTimeout(() => reject(new Error(`vision model call timed out after ${timeoutMs}ms`)), timeoutMs)
+    const abortGuard = new Promise<never>((_, reject) => {
       onAbort = () => reject(new DOMException("Aborted", "AbortError"))
       ctx.abort.addEventListener("abort", onAbort, { once: true })
     })
-    return Promise.race([promise, guarded]).finally(() => {
-      if (timer) clearTimeout(timer)
+    return withTimeout(
+      Promise.race([promise, abortGuard]),
+      timeoutMs,
+      `vision model call timed out after ${timeoutMs}ms`,
+    ).finally(() => {
       if (onAbort) ctx.abort.removeEventListener("abort", onAbort)
     })
   }
 
   /** 判断错误是否为中止信号（AbortError），供 attemptModel 标记 / 链循环中止整链。 */
   const isAbortError = (error: unknown): boolean => error instanceof Error && error.name === "AbortError"
+
+  /** 判断错误是否为本插件超时信号（DeadlineError）——与 AbortError 并列，表示"请求到期被本地掐断"。 */
+  const isDeadlineError = (error: unknown): boolean => error instanceof Error && error.name === "DeadlineError"
 
   /**
    * 单个候选的尝试：创建子会话（parentID 挂当前会话）→ 用该候选模型描述 →
@@ -296,6 +298,9 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   ): Promise<{ ok: true; text: string } | { ok: false; error: string; aborted?: boolean }> => {
     const dataURL = `data:${image.mime};base64,${image.bytes.toString("base64")}`
     let subID: string | undefined
+    // "回合可能仍在飞"标记：请求被本地 deadline（超时）或用户 abort 掐断时置位，
+    // finally 据此先 abort 子会话（取消 provider 端孤儿回合）再 delete。
+    let endedByDeadline = false
     try {
       const created = await withDeadline(
         input.client.session.create({ body: { parentID: ctx.sessionID, title: "vision analysis" } }),
@@ -334,11 +339,18 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       if (!text) return { ok: false, error: "vision model returned no text" }
       return { ok: true, text }
     } catch (error) {
-      // 异常（超时 / 中止 / 底层抛错）同样收敛为失败结果；aborted 标记交由链循环判断
+      // 异常（超时 / 中止 / 底层抛错）同样收敛为失败结果；aborted 标记交由链循环判断。
+      // 超时与中止都意味着底层请求可能仍在飞 → 需要先 abort 再 delete。
+      endedByDeadline = isDeadlineError(error) || isAbortError(error)
       return { ok: false, error: errText(error), aborted: isAbortError(error) }
     } finally {
       if (subID) {
         subSessions.delete(subID)
+        // 先 abort（best-effort，取消 provider 端孤儿回合）再 delete；
+        // 成功/普通失败路径 turn 已自然结束，无需 abort。
+        if (endedByDeadline) {
+          await input.client.session.abort({ path: { id: subID } }).catch(() => {})
+        }
         await input.client.session.delete({ path: { id: subID } }).catch(() => {})
       }
     }
