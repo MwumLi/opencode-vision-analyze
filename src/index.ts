@@ -525,11 +525,11 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       await fs.unlink(tmp).catch(() => {})
       return
     }
-    await evictDescriptionCache(dir)
+    await evictDescriptionCache(dir, path.basename(file))
   }
 
   /** LRU + 容量淘汰：超出 maxEntries / maxBytes 时按 mtime 升序删最旧，直到双条件满足。 */
-  const evictDescriptionCache = async (dir: string): Promise<void> => {
+  const evictDescriptionCache = async (dir: string, protectName?: string): Promise<void> => {
     try {
       const names = (await fs.readdir(dir)).filter((n) => n.endsWith(".json"))
       const stats = await Promise.all(
@@ -546,12 +546,15 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       const { maxEntries, maxBytes } = descriptionCacheLimits
       let total = entries.reduce((sum, e) => sum + e.size, 0)
       entries.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+      // 逐条删最旧直至双条件满足；刚写入的条目受保护（极端单条超限时保留最新，不自我删除）。
+      // 用额外计数控制，不就地改遍历数组（entries 仅作删除候选快照）。
+      let remaining = entries.length
       for (const entry of entries) {
-        if (entries.length <= maxEntries && total <= maxBytes) break
+        if (total <= maxBytes && remaining <= maxEntries) break
+        if (entry.name === protectName) continue
         await fs.unlink(path.join(dir, entry.name)).catch(() => {})
-        const idx = entries.indexOf(entry)
-        entries.splice(idx, 1)
         total -= entry.size
+        remaining -= 1
       }
     } catch {
       // 目录扫描/删除失败忽略：淘汰是 best-effort，下次写入再触发
