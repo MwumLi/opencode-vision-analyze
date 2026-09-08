@@ -1,6 +1,10 @@
 # 能力查询超时与子会话 abort（R1/R2）设计
 
 > 状态：定稿（2026-09-08，随 feat/provider-timeout-and-abort 分支实现）。
+> 变更记录（2026-09-08，实现合入前）：R2 落地后补一个小增强——把用户 abort 接入 URL 下载：
+> `downloadImage(url, abort)` 手动组合 ctx.abort + 30s 定时器驱动同一 AbortController（pre-abort 不再发请求、
+> 进行中的下载立即中断；不用 `AbortSignal.any()` 以兼容 engines node>=18 的 18.0–18.16）。
+> 相应 README「中止传导不完整」措辞收敛为「中止计费竞态」。
 > 范围：README Roadmap 前两项 —— ① `config.providers()` 能力查询超时保护；② 超时/中止路径先
 > `session.abort` 再 delete。R4（URL 私网拦截）经评审后决定不做，已从 Roadmap 移除；R5（区域裁剪）
 > 保留并另行 brainstorm。

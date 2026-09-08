@@ -40,7 +40,17 @@
 - [x] `src/index.ts` 头部注释同步更新（中止传导 + 能力查询 5s 超时）。
 - commit `01def45 docs: update roadmap and known limitations for R1/R2 (R4 descoped)`
 
-## Task 5 · 终验与交付
+## Task 5 · Commit 4 — URL 下载中止传导（R2 小增强）
+
+- [x] `test/plugin.test.ts` 新增用例（先红）：pre-abort 不发起 URL 下载（fetched 0、输出 Aborted）；
+  下载进行中 abort → fetch signal 中止、立即返回 Aborted、不建子会话。
+- [x] `src/index.ts`：`downloadImage(url, abort)` 手动组合 ctx.abort + 30s 定时器驱动同一
+  AbortController（不用 `AbortSignal.any()`，兼容 node>=18 的 18.0–18.16）；pre-abort 直接放弃；
+  `visionAnalyze` 调用点传 `ctx.abort`；头部注释措辞更新。
+- [x] 验收：门禁全绿（58 pass，URL 下载既有用例零 diff）。
+- commit `0df251a feat: cancel in-flight URL download on user abort`
+
+## Task 6 · 终验与交付
 
 - [x] `bun run typecheck && bun test && bun run build` 全绿（56 pass）
 - [x] `git log` 确认提交序列与工作区干净

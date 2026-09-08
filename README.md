@@ -130,7 +130,7 @@ Key behaviors:
 
 - **V1 session flow only** — hooks are attached to the V1 `SessionPrompt` path; if opencode's default interaction moves to the V2 session core, hooks won't fire (silently).
 - **SSRF surface** — URL downloads follow redirects and don't block private-range / cloud-metadata addresses. Acceptable for a local single-user CLI; add address filtering before using in multi-tenant environments.
-- **Partial abort propagation** — on timeout/abort the vision sub-session is aborted (`/session/{id}/abort`) before it is deleted, cancelling the provider-side orphan turn; a URL download already in flight still runs to its 30s deadline, and a turn may still be billed if the provider charged before the abort landed.
+- **Billing race on abort** — on timeout/abort the vision sub-session is aborted (`/session/{id}/abort`) before it is deleted and an in-flight URL download is cancelled immediately; a turn may still be billed if the provider charged before the abort landed (tokens already served are not refundable).
 - **Historical images** — images from messages sent before the plugin was enabled can't be described (no hint, no path on disk).
 - **Unbounded caches** — both the image store and the description cache grow without eviction (image store: git-project-scoped or user-cache-scoped; description cache: per process).
 
