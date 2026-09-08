@@ -15,7 +15,7 @@
 - **工具化，而非提交时预分析。** 轮次即时启动；模型自己决定何时看图、带着什么问题看。提交零阻塞，失败在 agent 循环里可见、可重试。
 - **描述针对问题。** 模型把自己关注的问题传给 `vision_analyze`——而不是提交时预生成的一次性通用描述。
 - **原生快速路径。** 主模型本身有视觉能力时，`vision_analyze` 完全跳过视觉模型，直接把原图作为工具附件返回。
-- **内容寻址缓存。** 图片按内容寻址 `<sha256>.<ext>` 落盘（跨会话、同一存储域内天然去重）；描述按 `<图片哈希>:<问题>` 缓存到**用户级共享目录**（`<cache>/opencode-vision-analyze/descriptions`）——跨项目/进程/插件重启同图同问题只描述一次；描述缓存 LRU 上限 2000 条 / 50MB。
+- **内容寻址缓存。** 图片按内容寻址 `<sha256>.<ext>` 落盘到**用户级共享目录**（`<cache>/opencode-vision-analyze/vision`，跨项目/会话天然去重，LRU 上限 2000 条 / 500MB）；描述按 `<图片哈希>:<问题>` 缓存到**用户级共享目录**（`<cache>/opencode-vision-analyze/descriptions`）——跨项目/进程/插件重启同图同问题只描述一次；描述缓存 LRU 上限 2000 条 / 50MB。
 - **统一鉴权。** 视觉调用走 opencode 子会话，复用 opencode 已管理的 provider 凭据，无需额外配置 API Key。
 
 ## 安装
@@ -69,7 +69,7 @@ curl 方式说明：
 
 受支持的图片扩展名：png / jpg / jpeg / gif / webp。
 
-图片存储：git 项目内图片放在 `<项目>/.opencode/vision`；非 git 目录则放入用户级缓存目录（`<cache>/opencode-vision-analyze/vision`）——与 opencode 自身的项目/全局会话分域一致。各平台默认：Linux `$XDG_CACHE_HOME || ~/.cache`；macOS `~/Library/Caches`（亦接受 `$XDG_CACHE_HOME` 覆盖）；Windows `%LOCALAPPDATA% || ~/AppData/Local`。缓存根 env 为空串视为未设置（回退默认）。git 项目中如不想跟踪缓存图片，请把 `.opencode/vision/` 加入 `.gitignore`。存储根在每次落盘时现算：切换存储范围（如执行 `git init`）后，从下一条贴图起即写入新域；旧会话 hint 里的绝对路径仍指向旧处，重新贴图即注入新 hint。
+图片存储：**恒定放用户级共享目录** `<cache>/opencode-vision-analyze/vision`（与 git / 非 git 分域无关），同一用户所有项目共享；每个唯一图片一个内容寻址 `<sha256>.<ext>` 文件。贴图与 http(s) 下载写入于此（临时文件 + rename 原子写，多个 opencode 进程可安全共享）；**模型直接把本地已存在文件路径传给工具时不复制、原位读用**。各平台默认：Linux `$XDG_CACHE_HOME || ~/.cache`；macOS `~/Library/Caches`（亦接受 `$XDG_CACHE_HOME` 覆盖）；Windows `%LOCALAPPDATA% || ~/AppData/Local`。缓存根 env 为空串视为未设置（回退默认）。图片缓存 LRU 上限 2000 条 / 500MB，任一超限即按文件 mtime 淘汰最久未用的条目——无需任何 `.gitignore` 条目。
 
 描述缓存：**恒定放用户级共享目录** `<cache>/opencode-vision-analyze/descriptions`（与 git / 非 git 分域无关）——每条目一个 JSON 文件，key 为 `<图片sha256>:<问题>`、文件名取 `sha256(key)`。容量上限 2000 条 / 50MB，任一超限即按文件 mtime 淘汰最久未用的条目（LRU）。写入为原子操作（临时文件 + rename），多个 opencode 进程可安全共享同一描述缓存。
 
@@ -100,8 +100,9 @@ curl 方式说明：
      ├─ 主模型支持图片输入 → 不做任何处理（原图直发）
      ├─ 无任何 image-capable 模型 → 不做处理（不注入 hint、不落盘；
      │    交给核心对图片的默认处理）
-     └─ 纯文本主模型 → 图片落盘到 vision 存储
-        （<sha256>.<ext>；git 项目内 → 项目目录，非 git → 用户缓存目录）
+     └─ 纯文本主模型 → 图片落盘到用户级 vision 存储
+        （<sha256>.<ext>；位于 <cache>/opencode-vision-analyze/vision；
+         本地已存在文件路径原位读用、不复制）
         并注入 synthetic 提示（TUI 隐藏、模型可见）：
         "用 vision_analyze 工具查看，image_path: ..."
 
@@ -135,7 +136,7 @@ vision_analyze 工具：
 
 - **仅 V1 会话流** —— 钩子挂在 V1 `SessionPrompt` 路径上；若 opencode 默认交互切到 V2 会话核心，钩子不会触发（且不报错）。
 - **历史图片** —— 插件启用之前发送的图片无法被描述（无提示、磁盘上无路径）。
-- **图片存储无上限** —— 图片存储不淘汰（git 项目级 / 用户级缓存目录）；描述缓存已受控（2000 条 / 50MB LRU）。
+- **缓存受控** —— 图片缓存与描述缓存均为用户级共享且 LRU 受控：图片 2000 条 / 500MB，描述 2000 条 / 50MB。
 
 ## Roadmap
 

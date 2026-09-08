@@ -6,27 +6,27 @@
 
 ## 任务拆解
 
-- [ ] 1. helpers 简化：`test/helpers.ts` 的 `makeTempDir()` 去掉自动创建 `.git`（git 语义不再相关）。
-- [ ] 2. 测试重写（红）：`test/plugin.test.ts`
-  - [ ] 2a. import 调整：移除 `isInsideGitRepo` / `resolveVisionDir`，改引 `userVisionCacheRoot`、`visionCacheLimits`。
-  - [ ] 2b. `persistedPath()` 改指 `cacheHome/opencode-vision-analyze/vision/<sha>.png`。
-  - [ ] 2c. 负向断言（无图不建目录等）改查用户级 vision 目录。
-  - [ ] 2d. 整块「图片存储分域（git / 用户级）」→「图片缓存（恒用户级 + LRU/容量）」：
+- [x] 1. helpers 简化：`test/helpers.ts` 的 `makeTempDir()` 去掉自动创建 `.git`（git 语义不再相关）。
+- [x] 2. 测试重写（红→绿）：`test/plugin.test.ts`
+  - [x] 2a. import 调整：移除 `isInsideGitRepo` / `resolveVisionDir`，改引 `userVisionCacheRoot`、`visionCacheLimits`。
+  - [x] 2b. `persistedPath()` 改指 `cacheHome/opencode-vision-analyze/vision/<sha>.png`。
+  - [x] 2c. 负向断言（无图不建目录等）改查用户级 vision 目录。
+  - [x] 2d. 整块「图片存储分域（git / 用户级）」→「图片缓存（恒用户级 + LRU/容量）」：
         `userVisionCacheRoot` 三平台/env/空串单测；git 目录贴图落用户级且项目 `.opencode` 零污染；
         并发同 sha（用户级目标）；fail-open tmp 清理；LRU 条数/字节淘汰；单图超限允许写 + 当次不被自删；
         LRU touch 缓存内延寿；touch 外部文件 mtime 不变。
-- [ ] 3. 源码：`src/index.ts`
-  - [ ] 3a. 删除 `isInsideGitRepo` / `resolveVisionDir` 导出与 `existsSync` import；顶部注释同步。
-  - [ ] 3b. 新增 `export const visionCacheLimits = { maxEntries: 2000, maxBytes: 500 * 1024 * 1024 }`。
-  - [ ] 3c. `persistImageBytes` 目录改 `userVisionCacheRoot(...)`；rename 后触发图片淘汰（protect 刚写文件）。
-  - [ ] 3d. 抽通用 `evictToCaps(dir, limits, { filter, protectName })`；`evictDescriptionCache` 改为其调用。
-  - [ ] 3e. `loadImage`：命中缓存根内文件 touch mtime；外部文件不 touch。
-- [ ] 4. 文档同步
-  - [ ] 4a. `.gitignore` 删 `.opencode/vision/` 条目。
-  - [ ] 4b. README.md / README.zh.md：图片存储段（恒用户级、本地路径直读、仅下载写缓存）、特性段、
+- [x] 3. 源码：`src/index.ts`
+  - [x] 3a. 删除 `isInsideGitRepo` / `resolveVisionDir` 导出与 `existsSync` import；顶部注释同步。
+  - [x] 3b. 新增 `export const visionCacheLimits = { maxEntries: 2000, maxBytes: 500 * 1024 * 1024 }`。
+  - [x] 3c. `persistImageBytes` 目录改 `userVisionCacheRoot(...)`；rename 后触发图片淘汰（protect 刚写文件）。
+  - [x] 3d. 抽通用 `evictToCaps(dir, limits, { filter, protectName })`；`evictDescriptionCache` 改为其调用。
+  - [x] 3e. `loadImage`：命中缓存根内文件 touch mtime；外部文件不 touch。
+- [x] 4. 文档同步
+  - [x] 4a. `.gitignore` 删 `.opencode/vision/` 条目。
+  - [x] 4b. README.md / README.zh.md：图片存储段（恒用户级、本地路径直读、仅下载写缓存）、特性段、
         原理图、已知限制。
-  - [ ] 4c. spec/plan 头部勾选与本档定稿。
-- [ ] 5. 门禁全绿 + commit（可分逻辑 commit：test red → src → docs）。
+  - [x] 4c. spec/plan 头部勾选与本档定稿。
+- [x] 5. 门禁全绿 + commit（可分逻辑 commit：test red → src → docs）。
 - [ ] 6. 交付 review：不自行 push / merge / 发版。
 
 ## 验收标准
