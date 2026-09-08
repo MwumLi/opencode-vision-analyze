@@ -15,7 +15,7 @@ A tool-based vision routing plugin for [opencode](https://opencode.ai): when the
 - **Tool-based, not pre-analysis.** The turn starts immediately; the model decides when (and with which question) to look. No blocking on submit, failures are visible and retryable inside the agent loop. Same philosophy as production-proven agent designs.
 - **Question-aware descriptions.** The model passes its own focused question to `vision_analyze` — not a one-shot generic caption computed at submit time.
 - **Native fast path.** If the main model is vision-capable, `vision_analyze` skips the vision model entirely and returns the raw image as a tool attachment.
-- **Content-addressed cache.** Images are stored as content-addressed `<sha256>.<ext>` files (deduped across sessions within the same store); descriptions are cached per `<image-hash>:<question>` — the same image with the same question is described exactly once.
+- **Content-addressed cache.** Images are stored as content-addressed `<sha256>.<ext>` files (deduped across sessions within the same store); descriptions are cached per `<image-hash>:<question>` in a **user-level shared directory** (`<cache>/opencode-vision-analyze/descriptions`) — the same image with the same question is described exactly once, across projects, processes, and plugin restarts. The description cache is LRU-capped (2000 entries / 50 MB).
 - **Unified auth.** The vision call runs through an opencode sub-session, so it reuses the provider credentials opencode already manages. No extra API key plumbing.
 
 ## Installation
@@ -71,6 +71,8 @@ Supported image extensions: png / jpg / jpeg / gif / webp.
 
 Image storage: inside a git project images live under `<project>/.opencode/vision`; in non-git directories they go to the user cache dir (`<cache>/opencode-vision-analyze/vision`) — mirroring opencode's own project/global session scoping. Defaults per platform: Linux `$XDG_CACHE_HOME || ~/.cache`, macOS `~/Library/Caches` (a `$XDG_CACHE_HOME` override is honored), Windows `%LOCALAPPDATA% || ~/AppData/Local`. An empty cache-root env var is treated as unset (falls back to the default). In git projects, add `.opencode/vision/` to your `.gitignore` if you don't want the cache tracked. The storage root is re-resolved on every write, so switching scope (e.g. after `git init`) takes effect on the next pasted image — though old session hints keep pointing at stale absolute paths until you re-paste.
 
+Description cache: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/descriptions` regardless of git scope — one JSON entry per `<image-sha>:<question>` key, named by `sha256(key)`. It is capped at 2000 entries / 50 MB with LRU eviction (oldest by file mtime is removed when either limit is exceeded). Writes are atomic (temp file + rename), so concurrent opencode processes can safely share the cache.
+
 An ordered-candidates example with auto-fallback and free-first discovery:
 
 ```jsonc
@@ -112,7 +114,8 @@ vision_analyze tool:
  │    → return raw image as attachment (no vision model call)
  ├─ http(s) image URL → download (20 MB cap) → same disk path
  ├─ description cache hit (sha + question) → return cached text
- │    (tagged with the model that produced it)
+ │    (persisted under <cache>/opencode-vision-analyze/descriptions,
+ │     tagged with the model that produced it, LRU-capped 2000 entries / 50 MB)
  └─ candidate chain: sub-session under current session per candidate, in order —
       parentID, all tools disabled, dedicated system prompt, image + question
       sent to that vision model → first success returns → sub-session deleted
@@ -132,11 +135,11 @@ Key behaviors:
 
 - **V1 session flow only** — hooks are attached to the V1 `SessionPrompt` path; if opencode's default interaction moves to the V2 session core, hooks won't fire (silently).
 - **Historical images** — images from messages sent before the plugin was enabled can't be described (no hint, no path on disk).
-- **Unbounded caches** — both the image store and the description cache grow without eviction (image store: git-project-scoped or user-cache-scoped; description cache: per process).
+- **Image store unbounded** — the image store has no eviction (git-project-scoped or user-cache-scoped). The description cache is bounded (2000 entries / 50 MB LRU).
 
 ## Roadmap
 
-- [ ] Persistent description cache (content-addressed on disk, with LRU / size cap)
+- [x] Persistent description cache (content-addressed on disk, with LRU / size cap)
 - [ ] Region cropping for zooming into image details
 
 ## Development
