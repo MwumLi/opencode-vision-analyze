@@ -43,12 +43,6 @@
  * 类型依赖仅 @opencode-ai/plugin 与 @opencode-ai/sdk 的 type import。
  *
  * 已知限制：
- * - SSRF 面：downloadImage 的 fetch 跟随重定向、不拦截私网/云元数据地址。
- *   本地单用户 CLI 的信任级别下可接受；生产多租户环境使用前应加私网
- *   地址拦截。
- * - 中止计费竞态：子会话在超时/中止路径先 `session.abort` 再 delete（取消
- *   provider 端孤儿回合），进行中的 URL 下载也会被立即取消；provider 若在
- *   abort 落地前已计费，该回合仍可能计入用量（已服务 token 不可退）。
  * - 能力查询（config.providers()）带 5 秒超时保护：挂起不会永久 stall，
  *   超时按查询失败降级（不缓存、可重试；自动模式空链按既有语义 memoize）。
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
