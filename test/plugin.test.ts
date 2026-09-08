@@ -7,7 +7,8 @@
  * URL 下载与错误路径 / 超时 / 永不抛错 / dispose 清理。
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test"
-import { access, mkdir, mkdtemp, writeFile, readdir } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { access, mkdir, mkdtemp, writeFile, readdir, stat, readFile } from "node:fs/promises"
 import path from "node:path"
 import { homedir, tmpdir } from "node:os"
 import type { PluginOptions, ToolContext, ToolResult } from "@opencode-ai/plugin"
@@ -31,17 +32,27 @@ import {
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
-import { isInsideGitRepo, resolveVisionDir, providersTimeout } from "../src/index"
+import { isInsideGitRepo, resolveVisionDir, providersTimeout, resolveDescriptionDir, descriptionCacheLimits } from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
 let dir: string
+/** 每次测试独立临时用户缓存根（XDG_CACHE_HOME）——描述缓存走用户级目录，需隔离防跨测试污染/写真实 home。 */
+let cacheHome: string
+/** 记录测试前的 XDG_CACHE_HOME，afterEach 还原。 */
+let prevXdgHome: string | undefined
 
 beforeEach(async () => {
   dir = await makeTempDir()
+  cacheHome = await mkdtemp(path.join(tmpdir(), "vision-cache-"))
+  prevXdgHome = process.env.XDG_CACHE_HOME
+  process.env.XDG_CACHE_HOME = cacheHome
 })
 
 afterEach(async () => {
+  if (prevXdgHome === undefined) delete process.env.XDG_CACHE_HOME
+  else process.env.XDG_CACHE_HOME = prevXdgHome
   await removeDir(dir)
+  await removeDir(cacheHome)
 })
 
 /** 文件是否存在（不抛错版）。 */
@@ -1235,3 +1246,243 @@ describe("图片存储分域（git / 用户级）", () => {
     }
   })
 })
+
+describe("描述缓存落盘持久化（用户级目录 + LRU/容量）", () => {
+  /** 描述缓存目录：cacheHome/opencode-vision-analyze/descriptions（Linux，XDG_CACHE_HOME 已由 beforeEach 注入）。 */
+  const descDir = () => path.join(cacheHome, "opencode-vision-analyze", "descriptions")
+  /** 给定 question 的缓存条目文件路径（key = TINY_PNG_SHA:question 的 sha256 命名）。 */
+  const descPath = (question: string) =>
+    path.join(descDir(), `${createHash("sha256").update(`${TINY_PNG_SHA}:${question}`).digest("hex")}.json`)
+  /** 写入测试图片到项目 vision 目录（供 loadImage）。 */
+  async function seedImage(): Promise<void> {
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+  }
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  test("resolveDescriptionDir：三平台默认 + env 覆盖 + 空串回退（与 git 无关恒用户级）", () => {
+    // Linux：默认 ~/.cache
+    expect(resolveDescriptionDir({}, "linux", "/home/u")).toBe(
+      path.join("/home/u", ".cache", "opencode-vision-analyze", "descriptions"),
+    )
+    // Linux + XDG_CACHE_HOME 覆盖
+    expect(resolveDescriptionDir({ XDG_CACHE_HOME: "/x/cache" }, "linux", "/home/u")).toBe(
+      path.join("/x/cache", "opencode-vision-analyze", "descriptions"),
+    )
+    // macOS：~/Library/Caches
+    expect(resolveDescriptionDir({}, "darwin", "/Users/u")).toBe(
+      path.join("/Users/u", "Library", "Caches", "opencode-vision-analyze", "descriptions"),
+    )
+    // macOS + XDG 覆盖
+    expect(resolveDescriptionDir({ XDG_CACHE_HOME: "/x/cache" }, "darwin", "/Users/u")).toBe(
+      path.join("/x/cache", "opencode-vision-analyze", "descriptions"),
+    )
+    // Windows：LOCALAPPDATA 覆盖 + 默认 ~/AppData/Local
+    expect(resolveDescriptionDir({ LOCALAPPDATA: "C:\\lapp" }, "win32", "C:\\Users\\u")).toBe(
+      path.join("C:\\lapp", "opencode-vision-analyze", "descriptions"),
+    )
+    expect(resolveDescriptionDir({}, "win32", "C:\\Users\\u")).toBe(
+      path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "descriptions"),
+    )
+    // 空串 env 视为未设置 → 回退默认
+    expect(resolveDescriptionDir({ XDG_CACHE_HOME: "" }, "linux", "/home/u")).toBe(
+      path.join("/home/u", ".cache", "opencode-vision-analyze", "descriptions"),
+    )
+    expect(resolveDescriptionDir({ LOCALAPPDATA: "" }, "win32", "C:\\Users\\u")).toBe(
+      path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "descriptions"),
+    )
+  })
+
+  test("命中持久化：第一实例写盘 → 第二独立实例（同缓存目录）直接命中、不再调视觉模型", async () => {
+    await seedImage()
+    const clientA = makeStubClient()
+    const { hooks: hooksA } = await loadPlugin(makePluginInput(dir, clientA), { models: ["test/vision-model"] })
+    const analyzeA = getAnalyze(hooksA)
+
+    const first = await analyzeA(
+      { image_path: persistedPath(), question: "persist me" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(first.title).toBe("vision_analyze")
+    expect(clientA.calls.prompt.length).toBe(1)
+    // 描述落盘到用户级缓存目录（git 项目也落用户级，不落项目内）
+    expect(await fileExists(descPath("persist me"))).toBe(true)
+
+    // 第二实例：全新闭包（无进程内缓存），共享同一 XDG_CACHE_HOME → 磁盘命中
+    const clientB = makeStubClient()
+    const { hooks: hooksB } = await loadPlugin(makePluginInput(dir, clientB), { models: ["test/vision-model"] })
+    const analyzeB = getAnalyze(hooksB)
+    const second = await analyzeB(
+      { image_path: persistedPath(), question: "persist me" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(second.title).toBe("vision_analyze (cached)")
+    expect(second.output).toContain("a red square")
+    expect(clientB.calls.prompt.length).toBe(0)
+  })
+
+  test("命中沿用入库 modelId：磁盘条目由 other-vision 产出，新实例命中标签仍为 other-vision", async () => {
+    await seedImage()
+    // 实例 A：链首 vision-model 失败 → other-vision 成功并入库（磁盘）
+    const clientA = makeStubClient()
+    clientA.setPromptBehavior((model) =>
+      model?.modelID === "vision-model"
+        ? { error: new Error("boom for vision") }
+        : { data: { parts: [{ type: "text", text: "described by other" }] } },
+    )
+    const { hooks: hooksA } = await loadPlugin(makePluginInput(dir, clientA), {
+      models: ["test/vision-model", "test/other-vision"],
+    } as PluginOptions)
+    const analyzeA = getAnalyze(hooksA)
+    await analyzeA(
+      { image_path: persistedPath(), question: "who labels" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(clientA.calls.prompt.length).toBe(2)
+    expect(await fileExists(descPath("who labels"))).toBe(true)
+
+    // 实例 B：默认行为（若真的调模型会用链首 vision-model 标签），磁盘命中应沿用 other-vision
+    const clientB = makeStubClient()
+    const { hooks: hooksB } = await loadPlugin(makePluginInput(dir, clientB), { models: ["test/vision-model"] })
+    const analyzeB = getAnalyze(hooksB)
+    const hit = await analyzeB(
+      { image_path: persistedPath(), question: "who labels" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(hit.title).toBe("vision_analyze (cached)")
+    expect(hit.output).toContain("described by test/other-vision")
+    expect(hit.output).toContain("described by other")
+    expect(clientB.calls.prompt.length).toBe(0)
+  })
+
+  test("LRU 条目上限：maxEntries=2 写 3 条 → 最旧条目被淘汰，目录只剩 2 条且最旧再问为 miss", async () => {
+    await seedImage()
+    const saved = { ...descriptionCacheLimits }
+    descriptionCacheLimits.maxEntries = 2
+    descriptionCacheLimits.maxBytes = 50 * 1024 * 1024 // 条目维度隔离：字节上限放大
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+    try {
+      const questions = ["q1", "q2", "q3"]
+      for (const q of questions) {
+        const r = await analyze({ image_path: persistedPath(), question: q }, toolCtx(new AbortController().signal))
+        expect(r.title).toBe("vision_analyze")
+        await sleep(10) // 拉开 mtime，保证淘汰顺序可判
+      }
+      // 容量：目录只剩 2 个条目（q1 被逐出）
+      const files = await readdir(descDir())
+      expect(files.filter((f) => f.endsWith(".json")).length).toBe(2)
+      expect(await fileExists(descPath("q1"))).toBe(false)
+      expect(await fileExists(descPath("q2"))).toBe(true)
+      expect(await fileExists(descPath("q3"))).toBe(true)
+
+      // 最旧（q1）再问 → miss，重新调用视觉模型
+      const promptsBefore = client.calls.prompt.length
+      const again = await analyze({ image_path: persistedPath(), question: "q1" }, toolCtx(new AbortController().signal))
+      expect(again.title).toBe("vision_analyze")
+      expect(client.calls.prompt.length).toBe(promptsBefore + 1)
+    } finally {
+      descriptionCacheLimits.maxEntries = saved.maxEntries
+      descriptionCacheLimits.maxBytes = saved.maxBytes
+    }
+  })
+
+  test("LRU 字节上限：maxBytes=500 写 3 条（各 ~242B）→ 淘汰最旧至总字节 ≤ 500", async () => {
+    await seedImage()
+    const saved = { ...descriptionCacheLimits }
+    descriptionCacheLimits.maxBytes = 500
+    const client = makeStubClient()
+    // 固定长描述（200 字符 → 单条 JSON ~242B），便于字节预算可判
+    client.setPromptBehavior(async () => ({ data: { parts: [{ type: "text", text: "x".repeat(200) }] } }))
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+    try {
+      for (const q of ["b1", "b2", "b3"]) {
+        const r = await analyze({ image_path: persistedPath(), question: q }, toolCtx(new AbortController().signal))
+        expect(r.title).toBe("vision_analyze")
+        await sleep(10)
+      }
+      // 3×242=726 > 500 → 淘汰 1 条 → 2×242=484 ≤ 500
+      const files = (await readdir(descDir())).filter((f) => f.endsWith(".json"))
+      expect(files.length).toBe(2)
+      const total = (
+        await Promise.all(
+          files.map(async (f) => (await stat(path.join(descDir(), f))).size),
+        )
+      ).reduce((a, b) => a + b, 0)
+      expect(total).toBeLessThanOrEqual(500)
+      // 最旧 b1 已淘汰；最新 b3 仍命中
+      expect(await fileExists(descPath("b1"))).toBe(false)
+      const promptsBefore = client.calls.prompt.length
+      const hit = await analyze({ image_path: persistedPath(), question: "b3" }, toolCtx(new AbortController().signal))
+      expect(hit.title).toBe("vision_analyze (cached)")
+      expect(client.calls.prompt.length).toBe(promptsBefore)
+    } finally {
+      descriptionCacheLimits.maxBytes = saved.maxBytes
+      descriptionCacheLimits.maxEntries = saved.maxEntries
+    }
+  })
+
+  test("并发写同 key（两个实例）：文件完整、无 .tmp-* 孤儿", async () => {
+    await seedImage()
+    const make = () => makeStubClient()
+    const { hooks: hooks1 } = await loadPlugin(makePluginInput(dir, make()), { models: ["test/vision-model"] })
+    const { hooks: hooks2 } = await loadPlugin(makePluginInput(dir, make()), { models: ["test/vision-model"] })
+    const args = { image_path: persistedPath(), question: "concurrent" } as const
+    await Promise.all([
+      getAnalyze(hooks1)(args, toolCtx(new AbortController().signal)),
+      getAnalyze(hooks2)(args, toolCtx(new AbortController().signal)),
+    ])
+    // 内容寻址原子写：最终文件完整可解析
+    const bytes = await readFile(descPath("concurrent"))
+    const parsed = JSON.parse(bytes.toString("utf8")) as { modelId: string; text: string }
+    expect(typeof parsed.modelId).toBe("string")
+    expect(parsed.text.length).toBeGreaterThan(0)
+    const files = await readdir(descDir())
+    expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
+  })
+
+  test("损坏 JSON → 当 miss：正常重描述并覆盖回合法内容", async () => {
+    await seedImage()
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+    const target = descPath("corrupt")
+    await mkdir(path.dirname(target), { recursive: true })
+    await writeFile(target, "not-json{{{")
+
+    const result = await analyze(
+      { image_path: persistedPath(), question: "corrupt" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(result.title).toBe("vision_analyze")
+    expect(result.output).toContain("a red square")
+    expect(client.calls.prompt.length).toBe(1)
+    // 写回覆盖成合法 JSON
+    const bytes = await readFile(target)
+    expect(JSON.parse(bytes.toString("utf8"))).toHaveProperty("text")
+  })
+
+  test("写失败 fail-open：目标为同名非空目录 → rename 失败，工具仍返回文本、无 tmp 孤儿、不抛错", async () => {
+    await seedImage()
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+    // 预先在目标条目路径放一个非空目录 → store 的 rename(tmp, target) 失败
+    const clash = descPath("clash")
+    await mkdir(clash, { recursive: true })
+    await writeFile(path.join(clash, "occupied"), "x")
+
+    const result = await analyze(
+      { image_path: persistedPath(), question: "clash" },
+      toolCtx(new AbortController().signal),
+    )
+    // 描述成功照常返回（缓存写失败是 best-effort，不阻断工具）
+    expect(result.output).toContain("a red square")
+    expect(client.calls.prompt.length).toBe(1)
+    const files = await readdir(descDir())
+    expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
+  })
+})
+
