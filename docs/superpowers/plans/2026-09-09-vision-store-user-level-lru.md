@@ -27,7 +27,7 @@
         原理图、已知限制。
   - [x] 4c. spec/plan 头部勾选与本档定稿。
 - [x] 5. 门禁全绿 + commit（可分逻辑 commit：test red → src → docs）。
-- [ ] 6. 交付 review：不自行 push / merge / 发版。
+- [x] 6. 交付 review：不自行 push / merge / 发版。
 
 ## 验收标准
 
