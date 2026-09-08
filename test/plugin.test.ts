@@ -10,7 +10,7 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test"
 import { createHash } from "node:crypto"
 import { access, mkdir, mkdtemp, writeFile, readdir, stat, readFile } from "node:fs/promises"
 import path from "node:path"
-import { homedir, tmpdir } from "node:os"
+import { tmpdir } from "node:os"
 import type { PluginOptions, ToolContext, ToolResult } from "@opencode-ai/plugin"
 import {
   TINY_PNG,
