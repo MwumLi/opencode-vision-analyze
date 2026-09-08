@@ -7,29 +7,6 @@
  * （TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具让指定的视觉
  * 模型描述图片。若主模型本身支持图片输入，则不做任何干预，原图直接发给主模型。
  *
- * 安装方式一（npm）：
- *   {
- *     "plugin": [["opencode-vision-analyze", { "models": ["provider/vision-model"] }]]
- *   }
- *
- * 安装方式二（curl 下载单文件，免 npm）：
- *   mkdir -p .opencode
- *   curl -fsSL <raw-url>/src/index.ts -o .opencode/vision-analyze.ts
- *   {
- *     "plugin": [["./.opencode/vision-analyze.ts", { "models": ["provider/vision-model"] }]]
- *   }
- *
- * 选项：
- *   - models（可选，缺省/空数组 = 自动模式）：有序视觉候选数组，如
- *     ["provider-a/m1", "provider-b/m2"]；单模型写 ["provider/model"] 即可
- *   - unlisted_fallback（可选，默认 false）：显式候选耗尽后自动续接未列出的 image-capable 模型
- *   - free_first（可选，默认 false）：自动发现档序反转（custom/匿名免费源优先，默认 config 优先）
- *   - timeout_ms：单候选子会话请求的超时毫秒数（正数，默认 60000）
- *
- * 候选链语义：显式 models 恒在链首；缺省/空数组 → 自动发现全部 image-capable
- * 模型并按 Provider.source 档序排列。链上候选逐个尝试，成功即止，全败聚合报错。
- * 描述子会话的模型属于候选链，chat.message 递归防护以整链成员为集。
- *
  * 工作方式（vision_analyze 工具路径）：主模型调用 vision_analyze 时，插件
  * 创建一个 parentID 挂在当前会话下的临时子会话（不进会话列表、不生成
  * 标题、禁用全部工具），把原图以 data URL 发给视觉模型，取回描述文字后
