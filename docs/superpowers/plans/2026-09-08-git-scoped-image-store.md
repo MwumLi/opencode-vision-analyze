@@ -54,6 +54,8 @@
 - Step 1（红）：并发写同一 sha 两次 → 断言最终文件字节完整、无中间态残留。
 - Step 2: 确认实现经 rename 后通过；`bun test` 全绿。
 - commit: `test(storage): concurrent same-sha writes are atomic`
+- 偏差注记：**实际并入** `feat(storage)` commit（98fa3e5，与 Task 2 一起提交），未单独成 commit；
+  测试内容一致（`plugin.test.ts` 并发用例），功能无影响，仅历史无法还原 Task 3 独立红/绿步骤。
 
 ## Task 4：文档同步
 
@@ -63,6 +65,17 @@
   本 spec 状态行已定稿。**不回改历史 spec**（只读存档）。
 - Step 2: `bun run typecheck && bun test && bun run build` 最终全绿。
 - commit: `docs: document git-scoped image storage and roadmap persistent description cache`
+
+## 评审跟进（2026-09-08 council，有条件通过后修复）
+
+- `fix(storage): treat empty cache-root env as unset; resolve relative input dir`（03dba41）
+  —— P1-1 env 空串视为未设置（三平台回退默认，杜绝相对路径落盘）+ P2-4 git 分支 `path.resolve`；
+  补 darwin+XDG、win 无 LOCALAPPDATA、三平台空串、深层上溯祖先 `.git` 文件测试。
+- `refactor(storage): atomic persist helper with tmp cleanup and per-write dir resolve`（69aa2c9）
+  —— P2-3 失败路径 `unlink` 孤儿 tmp；P2-5 移除加载期一次性 `visionDir`，改为 `persistImageBytes`
+  每次落盘现算存储根（运行中 git init 即时切换）；下载/贴图两处收敛；补失败路径清理 e2e。
+- 本 commit（docs）—— P2-1/P2-6/P2-7/P2-8 决策表与措辞对齐、Task 3 偏差注记、模块头已知限制同步。
+- 残余项（记录不阻塞）：downloadImage 并发用例、真跨进程并发模拟、相对 inputDir 单测均未覆盖。
 
 ## 验证门禁
 

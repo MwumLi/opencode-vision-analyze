@@ -15,7 +15,7 @@
 - **工具化，而非提交时预分析。** 轮次即时启动；模型自己决定何时看图、带着什么问题看。提交零阻塞，失败在 agent 循环里可见、可重试。
 - **描述针对问题。** 模型把自己关注的问题传给 `vision_analyze`——而不是提交时预生成的一次性通用描述。
 - **原生快速路径。** 主模型本身有视觉能力时，`vision_analyze` 完全跳过视觉模型，直接把原图作为工具附件返回。
-- **内容寻址缓存。** 图片按内容寻址 `<sha256>.<ext>` 落盘（跨会话、跨目录天然去重）；描述按 `<图片哈希>:<问题>` 缓存——同图同问题只描述一次。
+- **内容寻址缓存。** 图片按内容寻址 `<sha256>.<ext>` 落盘（跨会话、同一存储域内天然去重）；描述按 `<图片哈希>:<问题>` 缓存——同图同问题只描述一次。
 - **统一鉴权。** 视觉调用走 opencode 子会话，复用 opencode 已管理的 provider 凭据，无需额外配置 API Key。
 
 ## 安装
@@ -69,7 +69,7 @@ curl 方式说明：
 
 受支持的图片扩展名：png / jpg / jpeg / gif / webp。
 
-图片存储：git 项目内图片放在 `<项目>/.opencode/vision`；非 git 目录则放入用户级缓存目录（`<cache>/opencode-vision-analyze/vision`）——与 opencode 自身的项目/全局会话分域一致。git 项目中如不想跟踪缓存图片，请把 `.opencode/vision/` 加入 `.gitignore`。注意：切换存储范围（如执行 `git init` 后）会让旧会话 hint 里的绝对路径失效——重新贴图即会注入新 hint。
+图片存储：git 项目内图片放在 `<项目>/.opencode/vision`；非 git 目录则放入用户级缓存目录（`<cache>/opencode-vision-analyze/vision`）——与 opencode 自身的项目/全局会话分域一致。各平台默认：Linux `$XDG_CACHE_HOME || ~/.cache`；macOS `~/Library/Caches`（亦接受 `$XDG_CACHE_HOME` 覆盖）；Windows `%LOCALAPPDATA% || ~/AppData/Local`。缓存根 env 为空串视为未设置（回退默认）。git 项目中如不想跟踪缓存图片，请把 `.opencode/vision/` 加入 `.gitignore`。存储根在每次落盘时现算：切换存储范围（如执行 `git init`）后，从下一条贴图起即写入新域；旧会话 hint 里的绝对路径仍指向旧处，重新贴图即注入新 hint。
 
 有序候选 + 自动续接 + 免费优先的配置示例：
 

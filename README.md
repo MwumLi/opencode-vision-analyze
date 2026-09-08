@@ -13,7 +13,7 @@ A tool-based vision routing plugin for [opencode](https://opencode.ai): when the
 - **Tool-based, not pre-analysis.** The turn starts immediately; the model decides when (and with which question) to look. No blocking on submit, failures are visible and retryable inside the agent loop. Same philosophy as production-proven agent designs.
 - **Question-aware descriptions.** The model passes its own focused question to `vision_analyze` — not a one-shot generic caption computed at submit time.
 - **Native fast path.** If the main model is vision-capable, `vision_analyze` skips the vision model entirely and returns the raw image as a tool attachment.
-- **Content-addressed cache.** Images are stored as content-addressed `<sha256>.<ext>` files (deduped across sessions and directories); descriptions are cached per `<image-hash>:<question>` — the same image with the same question is described exactly once.
+- **Content-addressed cache.** Images are stored as content-addressed `<sha256>.<ext>` files (deduped across sessions within the same store); descriptions are cached per `<image-hash>:<question>` — the same image with the same question is described exactly once.
 - **Unified auth.** The vision call runs through an opencode sub-session, so it reuses the provider credentials opencode already manages. No extra API key plumbing.
 
 ## Installation
@@ -67,7 +67,7 @@ Notes for the curl path:
 
 Supported image extensions: png / jpg / jpeg / gif / webp.
 
-Image storage: inside a git project images live under `<project>/.opencode/vision`; in non-git directories they go to the user cache dir (`<cache>/opencode-vision-analyze/vision`) — mirroring opencode's own project/global session scoping. In git projects, add `.opencode/vision/` to your `.gitignore` if you don't want the cache tracked. Note: switching storage scope (e.g. after `git init`) leaves old session hints pointing at stale absolute paths — re-paste the image and a fresh hint is injected.
+Image storage: inside a git project images live under `<project>/.opencode/vision`; in non-git directories they go to the user cache dir (`<cache>/opencode-vision-analyze/vision`) — mirroring opencode's own project/global session scoping. Defaults per platform: Linux `$XDG_CACHE_HOME || ~/.cache`, macOS `~/Library/Caches` (a `$XDG_CACHE_HOME` override is honored), Windows `%LOCALAPPDATA% || ~/AppData/Local`. An empty cache-root env var is treated as unset (falls back to the default). In git projects, add `.opencode/vision/` to your `.gitignore` if you don't want the cache tracked. The storage root is re-resolved on every write, so switching scope (e.g. after `git init`) takes effect on the next pasted image — though old session hints keep pointing at stale absolute paths until you re-paste.
 
 An ordered-candidates example with auto-fallback and free-first discovery:
 

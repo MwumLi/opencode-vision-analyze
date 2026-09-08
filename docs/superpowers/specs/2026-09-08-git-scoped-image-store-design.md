@@ -20,10 +20,11 @@
 | 决策项 | 结论 |
 |---|---|
 | 判定依据 | 从 `input.directory` 向上逐级找 `.git`（**目录或文件**，覆盖 worktree/submodule）直至文件系统根；命中即视为 git 项目 |
-| git 项目存储 | `<input.directory>/.opencode/vision`（现状，零行为变更；即使 0 commit 也按 git 处理——比 opencode 当前"需有提交"更宽，落在 #15192 提议方向上，且避免依赖外部 git 命令） |
-| 非 git 存储 | 用户级缓存：Linux `$XDG_CACHE_HOME\|\|~/.cache`；macOS `~/Library/Caches`；Windows `%LOCALAPPDATA%\|\|~/AppData/Local` → 追加 `opencode-vision-analyze/vision`；`mkdir` 用 `0o700` |
-| 配置入口 | **不新增选项**：纯自动规则，目录解析收敛为单点函数，便于将来按需扩展显式覆盖 |
-| 写盘原子性 | 共享目录下多进程/多实例并发写同 sha：先写临时文件再 `rename`（内容寻址幂等，防撕裂） |
+| git 项目存储 | `<项目>/.opencode/vision`（现状，零行为变更）。**`<项目>` = `input.directory`（opencode 打开的目录）**：命中**祖先** `.git` 即视为在库，但落盘仍在 `input.directory` 下、不上溯仓库根（与基线一致）；即使 0 commit 也按 git 处理（避免依赖外部 git 命令）。新建目录统一 `0o700` |
+| 非 git 存储 | 用户级缓存：Linux `$XDG_CACHE_HOME\|\|~/.cache`；macOS `~/Library/Caches`（**亦接受 `$XDG_CACHE_HOME` 覆盖**，跨平台统一 dotfiles 的宽容超集）；Windows `%LOCALAPPDATA%\|\|~/AppData/Local` → 追加 `opencode-vision-analyze/vision`。三平台 **env 空字符串视为未设置**（XDG/LOCALAPPDATA 官规），避免空串产出相对路径。`mkdir` 用 `0o700` |
+| 配置入口 | **不新增选项**：纯自动规则，目录解析收敛为单点纯函数，便于将来按需扩展显式覆盖 |
+| 写盘原子性 | 共享目录下多进程/多实例并发写同 sha：先写临时文件再 `rename`（内容寻址幂等，防撕裂）；**失败路径先 `unlink` 临时文件再抛错**，避免孤儿 tmp 累积 |
+| 落盘时机 | **每次落盘现算存储根**（纯同步 existsSync 上溯，可忽略）：运行中存储范围变化（如 `git init`）从下一条图片起即时生效，无需重启 |
 | 失败语义 | 沿用 fail-open：落盘失败只是少了 vision_analyze 提示，不影响消息入库；目录解析为纯同步、无网络 |
 | 迁移 | 不自动迁移历史目录；文档注明旧 hint 里的绝对路径在切换后 stale，重贴即可 |
 
@@ -50,16 +51,21 @@ isInsideGitRepo(dir):
 ```
 resolveVisionDir(inputDir, env, platform, homedir):
   isInsideGitRepo(inputDir) == true
-    → join(inputDir, ".opencode", "vision")
+    → join(resolve(inputDir), ".opencode", "vision")   // resolve 消除相对 inputDir 依赖 cwd
   else
-    base = 平台 cache 根（见决策表）
+    base = 平台 cache 根（见决策表，空串 env 视为未设置）
     → join(base, "opencode-vision-analyze", "vision")   // mkdir 0o700
 ```
 
-### 落盘写入（下载 / 贴图统一收敛到同一目录解析结果）
+> 为何不用平台提供的 `input.project.vcs` / `vcsDir` 字段：插件输入只保证最小契约，不同 opencode
+> 版本/场景下该字段可能缺失或语义漂移；自 walk `.git`（目录/文件均可）行为稳定、无外部命令依赖，
+> 且保持测试零改动（helpers 伪造的 `vcs: "git"` 字段本就不参与判定）。将来需显式覆盖时再加配置面。
+
+### 落盘写入（下载 / 贴图统一收敛到 `persistImageBytes`）
 - 计算 `sha256`；目标文件 `<sha><ext>`。
-- 写入临时文件 `<sha><ext>.tmp-<randomUUID>` → `rename` 到目标（同目录原子替换）。
-- mkdir 失败/写失败：沿用既有 fail-open 语义（贴图返回 undefined 跳过；下载返回错误文字）。
+- 每次落盘现算存储根；写入临时文件 `<sha><ext>.tmp-<randomUUID>` → `rename` 到目标（同目录原子替换）。
+- 写/rename 失败：`unlink` 临时文件后按调用方语义返回（贴图 fail-open 返回 undefined 跳过；下载返回错误文字）。
+- 运行中存储范围变化（git init）→ 下一条图片即落新域（README「重贴即注入新 hint」成立，无需重启）。
 
 ### 运行影响
 - 图片消费全部在本进程内（磁盘读 → base64 data URL → 子会话/附件），目录放用户级**无跨主机可见性问题**。
@@ -73,7 +79,8 @@ helpers：
 
 plugin.test 新增：
 1. `isInsideGitRepo`：根目录 `.git` 目录命中；子目录向上命中；`.git` 为**文件**（worktree）命中；无 `.git` 返回 false。
-2. `resolveVisionDir`（注入 env/platform/homedir）：git → `inputDir/.opencode/vision`；非 git → 三平台用户缓存根（含 XDG_CACHE_HOME / LOCALAPPDATA 覆盖分支）。
+2. `resolveVisionDir`（注入 env/platform/homedir）：git → `inputDir/.opencode/vision`；非 git → 三平台用户缓存根（含 XDG_CACHE_HOME / LOCALAPPDATA 覆盖分支、**darwin+XDG**、win 无 LOCALAPPDATA 默认、**env 空串 → 回退默认**）。
+3. `isInsideGitRepo` 补：**深层子目录上溯命中祖先 `.git` 文件**（worktree 组合）。
 3. 端到端（非 git 目录 + 临时 XDG_CACHE_HOME，测试内设置并还原 env）：chat 贴图后图片落在 `$XDG_CACHE_HOME/opencode-vision-analyze/vision/<sha>.png`，hint 的 image_path 指向该处。
 4. 端到端（git 目录 = 带 `.git` 的临时目录）：贴图落在 `dir/.opencode/vision/<sha>.png`（回归，等价现状）。
 5. 并发写同 sha：两次并发写同一 sha → 最终文件完整（rename 原子）。
