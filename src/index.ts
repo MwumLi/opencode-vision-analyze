@@ -81,6 +81,24 @@ const MIME_EXT: Record<string, string> = {
 }
 
 /**
+ * 内部超时错误类型（name = "DeadlineError"）。
+ * 与 AbortError 并列可判别：超时路径（providers 查询 / 子会话请求）据此判断
+ * "底层请求可能仍在飞"，供调用方决定是否需要 abort 取消（见 attemptModel）。
+ */
+class DeadlineError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "DeadlineError"
+  }
+}
+
+/**
+ * `config.providers()` 能力查询的超时预算（毫秒）。做成可改写对象（而非常量/选项）：
+ * 避免选项膨胀；测试把 ms 调小即可缩短等待（TS 不允许对 import 的 let 绑定赋值）。
+ */
+export const providersTimeout = { ms: 5000 }
+
+/**
  * 视觉子会话使用的系统提示词。
  * 要求：精确转录图中文字，描述 UI/布局/对象/颜色等，优先回答用户问题，
  * 不使用工具，纯文本回复。
@@ -216,6 +234,24 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     if (error instanceof Error) return error.message
     if (typeof error === "string") return error
     return JSON.stringify(error) ?? String(error)
+  }
+
+  /**
+   * 无 ToolContext 的超时原语：到期以 DeadlineError(timeoutMessage) 拒绝。
+   * 与 withDeadline 的差别是它不感知 abort——能力查询（providers）等无 ctx 的
+   * 请求只关心"别永久挂起"，不需要监听用户中止；子会话请求由 withDeadline 组合
+   * abort 信号后复用它，保证全插件只有一套计时机制。
+   */
+  const withTimeout = async <T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const guard = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new DeadlineError(timeoutMessage)), ms)
+    })
+    try {
+      return await Promise.race([promise, guard])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   /**
@@ -483,7 +519,11 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     const cached = imageCapable.get(key)
     if (cached !== undefined) return cached
     try {
-      const result = await input.client.config.providers()
+      const result = await withTimeout(
+        input.client.config.providers(),
+        providersTimeout.ms,
+        `config.providers() timed out after ${providersTimeout.ms}ms`,
+      )
       // HTTP 非 2xx 时 openapi-fetch 不抛错而是返回 { error }（data 为空）。
       // 「查询失败」不能缓存成 false——那是一次瞬时故障而非「确认不支持」，
       // 缓存会永久关闭能力门控；本次保守返回 false，下次再重试。
@@ -535,7 +575,11 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    */
   const listImageCapableModels = async (): Promise<Array<{ providerID: string; modelID: string }>> => {
     try {
-      const result = await input.client.config.providers()
+      const result = await withTimeout(
+        input.client.config.providers(),
+        providersTimeout.ms,
+        `config.providers() timed out after ${providersTimeout.ms}ms`,
+      )
       if (!result.data) return []
       const found: Array<{ providerID: string; modelID: string; tier: number }> = []
       for (const provider of result.data.providers ?? []) {

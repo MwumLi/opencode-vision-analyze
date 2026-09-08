@@ -31,7 +31,7 @@ import {
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
-import { isInsideGitRepo, resolveVisionDir } from "../src/index"
+import { isInsideGitRepo, resolveVisionDir, providersTimeout } from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
 let dir: string
@@ -818,6 +818,43 @@ describe("URL 图片下载", () => {
 })
 
 describe("超时 / 中止 / 容错", () => {
+  test("R1：providers 能力查询挂起 → 超时降级（不永久 stall、不注入 hint、空链 memoize）", async () => {
+    const client = makeStubClient()
+    // providers 永不 resolve：模拟能力查询挂起
+    client.setProvidersResult(() => new Promise(() => {}))
+    const original = providersTimeout.ms
+    providersTimeout.ms = 25
+    try {
+      const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions) // auto 模式
+      const out = chatOutput([imagePart()])
+      const started = Date.now()
+      // model 缺省（等价 SDK/TUI 首条消息）：递归防护与能力门控都不查询，只走 resolveChain 一次
+      await hooks["chat.message"](chatInput({ sessionID: "ses_1" }), out)
+      const elapsed = Date.now() - started
+
+      // 空链降级：不注入 hint
+      const hintTexts = out.parts
+        .map((p) => (p as { text?: string }).text)
+        .filter((t): t is string => typeof t === "string" && t.includes("vision_analyze"))
+      expect(hintTexts).toHaveLength(0)
+      // 超时降级而非永久挂起：等满超时后正常返回
+      expect(elapsed).toBeGreaterThanOrEqual(20)
+      expect(elapsed).toBeLessThan(1000)
+      expect(client.calls.providers).toBe(1)
+
+      // 第二次同消息：空链被 memoize → 不再发起 providers 查询、不 stall
+      const out2 = chatOutput([imagePart()])
+      await hooks["chat.message"](chatInput({ sessionID: "ses_1" }), out2)
+      expect(client.calls.providers).toBe(1)
+      const hintTexts2 = out2.parts
+        .map((p) => (p as { text?: string }).text)
+        .filter((t): t is string => typeof t === "string" && t.includes("vision_analyze"))
+      expect(hintTexts2).toHaveLength(0)
+    } finally {
+      providersTimeout.ms = original
+    }
+  })
+
   test("超时：timeout_ms 到期后返回超时错误并清理子会话", async () => {
     const client = makeStubClient()
     client.setPromptBehavior(() => new Promise(() => {}))
