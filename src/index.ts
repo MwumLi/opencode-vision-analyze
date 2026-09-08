@@ -12,8 +12,8 @@
  * 标题、禁用全部工具），把原图以 data URL 发给视觉模型，取回描述文字后
  * 删除子会话并返回描述。同一张图 + 同一问题的描述按「<图片sha256>:<问题>」
  * 键缓存到**用户级共享目录**（<cache>/opencode-vision-analyze/descriptions，
- * 每条目一文件、mtime 作 LRU 时钟、2000 条 / 50MB 双上限）——跨项目/跨进程/
- * 插件重启后同图同问题只描述一次。
+ * 每条目一文件、mtime 作 LRU 时钟、2000 条 / 50MB 双上限、单条超限不入缓存）——
+ * 跨项目/跨进程/插件重启后同图同问题只描述一次。
  * image_path 除了绝对路径也接受 http(s) URL：先下载落盘到同一 vision
  * 目录（内容哈希命名，天然与附件落盘去重），再走统一的磁盘加载路径。
  * 主模型本身支持图片输入时走快速路径：不做子会话描述，直接把原图作为
@@ -164,7 +164,8 @@ export function resolveDescriptionDir(
  * 描述缓存的容量上限（模块级可变对象，便于测试注入小值；与 providersTimeout 同风格）。
  * - maxEntries：最大条目数（2000）
  * - maxBytes：条目文件字节总和上限（50 MB）
- * 任一超限即触发 LRU 淘汰（按文件 mtime 升序删最旧），直至双条件满足。
+ * 容量超限触发 LRU 淘汰（按文件 mtime 升序删最旧）。**单条即超 maxBytes 的条目不入缓存**
+ * （A / 硬上限，写前 utf8 字节预检跳过），保证磁盘恒 ≤ maxBytes、不因巨值挤掉已付费条目。
  */
 export const descriptionCacheLimits = {
   maxEntries: 2000,
@@ -512,14 +513,22 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     }
   }
 
-  /** 写描述缓存（tmp+rename 原子）并触发容量淘汰；任何失败静默吞掉（best-effort）。 */
+  /**
+   * 写描述缓存（tmp+rename 原子）并触发容量淘汰；任何失败静默吞掉（best-effort）。
+   * 超限策略（A / 硬上限）：序列化后先按 utf8 字节预检，单条 > maxBytes 则**不入缓存**
+   * （不写盘、不触发淘汰、不删除该 key 已有的旧条目）——避免"超限巨值挤掉全部已付费条目、
+   * 且自身活不过下一次无关写入"的写→删抖动，保证磁盘恒 ≤ maxBytes。
+   */
   const descCacheSet = async (key: string, value: { modelId: string; text: string }): Promise<void> => {
+    const payload = JSON.stringify(value)
+    // 口径与 evict 的 fs.stat().size 一致：磁盘 utf8 字节，非字符串 length（中文/emoji 不等价）
+    if (Buffer.byteLength(payload, "utf8") > descriptionCacheLimits.maxBytes) return
     const file = descCacheFile(key)
     const dir = path.dirname(file)
     const tmp = path.join(dir, `${path.basename(file)}.tmp-${randomUUID()}`)
     try {
       await fs.mkdir(dir, { recursive: true, mode: 0o700 })
-      await fs.writeFile(tmp, JSON.stringify(value))
+      await fs.writeFile(tmp, payload)
       await fs.rename(tmp, file)
     } catch {
       await fs.unlink(tmp).catch(() => {})

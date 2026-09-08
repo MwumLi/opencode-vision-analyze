@@ -1424,6 +1424,44 @@ describe("描述缓存落盘持久化（用户级目录 + LRU/容量）", () => 
     }
   })
 
+  test("单条超限不入缓存（A 策略）：不落盘、正常返回文本、其它条目原封不动", async () => {
+    await seedImage()
+    const saved = { ...descriptionCacheLimits }
+    descriptionCacheLimits.maxBytes = 500
+    descriptionCacheLimits.maxEntries = 2000
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+    try {
+      // 先写一条正常条目（~"a red square" 数十 B，远小于 cap）
+      const normal = await analyze(
+        { image_path: persistedPath(), question: "small" },
+        toolCtx(new AbortController().signal),
+      )
+      expect(normal.title).toBe("vision_analyze")
+      expect(await fileExists(descPath("small"))).toBe(true)
+
+      // 换超大描述（单条 JSON >> maxBytes）→ 预检拒绝入缓存
+      client.setPromptBehavior(async () => ({ data: { parts: [{ type: "text", text: "y".repeat(5000) }] } }))
+      const big = await analyze(
+        { image_path: persistedPath(), question: "huge" },
+        toolCtx(new AbortController().signal),
+      )
+      // 描述照常返回（缓存只是 best-effort），但该 key 不落盘
+      expect(big.output).toContain("yyyyy")
+      expect(await fileExists(descPath("huge"))).toBe(false)
+      // 缓存目录中正常条目不被冲掉、总量仍在 cap 内
+      expect(await fileExists(descPath("small"))).toBe(true)
+      const files = (await readdir(descDir())).filter((f) => f.endsWith(".json"))
+      expect(files.length).toBe(1)
+      const total = (await stat(path.join(descDir(), files[0]))).size
+      expect(total).toBeLessThanOrEqual(500)
+    } finally {
+      descriptionCacheLimits.maxBytes = saved.maxBytes
+      descriptionCacheLimits.maxEntries = saved.maxEntries
+    }
+  })
+
   test("并发写同 key（两个实例）：文件完整、无 .tmp-* 孤儿", async () => {
     await seedImage()
     const make = () => makeStubClient()

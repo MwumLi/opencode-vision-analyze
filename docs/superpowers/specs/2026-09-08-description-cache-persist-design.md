@@ -1,12 +1,20 @@
 # 描述缓存按内容 sha 落盘持久化（含 LRU / 容量上限）设计
 
-> 状态：定稿（2026-09-08，用户 review 通过）。
+> 状态：定稿（2026-09-08，用户 review 通过并实现）。
+> 变更记录（2026-09-08 晚 → 09-09 晨，同一次迭代 review 内修订，未合入前原位修改）：
+> 明确「单条描述超 maxBytes」的处置为 **A / 硬上限（超限不入缓存）**：写盘前先按序列化后的
+> utf8 字节预检（`Buffer.byteLength(payload, "utf8") > maxBytes` 则跳过写入、不触发淘汰、
+> 不删除该 key 已有旧文件）——避免超限巨值入缓存后挤掉全部已付费条目、且自身活不过下一次
+> 无关写入的写→删抖动。**写入次序保持 write-then-evict 不变，`protectName` 保留**（除防单次
+> 淘汰自删外，还防御同 mtime 平局按文件名裁决时"刚写入条目被自己的淘汰删除"的边角）。
 > 关联实现文件：`src/index.ts`、`test/plugin.test.ts`
 > 关联文档：`README.md`、`README.zh.md`、`docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md`
 > 决策依据（生态调研）：opencode 视觉插件（showlotus/opencode-image-vision、JochenYang/opencode-vision、
 > martinmose/opencode-vision-bridge 等）普遍把图片放 OS temp / 用户级 cache 目录而非 git 项目内，描述缓存多为
 > 进程内 LRU 或不做磁盘持久化；hermes-agent 将图片/下载件放用户级 `cache` 目录。本项目描述缓存落盘属超出生态
-> 的增强，但方向一致（用户级共享、内容寻址、LRU 受控）。
+> 的增强，但方向一致（用户级共享、内容寻址、LRU 受控）。超限处置与磁盘型内容缓存先例一致：memcached
+> `item_size_max` / Squid `maximum_object_size` 均对超上限的单条目直接拒绝存储，而非挤掉其余（内存 KV
+> Redis 才容忍临时超限——本项目是磁盘型缓存，同构 memcached/Squid 而非 Redis）。
 
 ## 背景与动机
 
@@ -31,6 +39,8 @@ Roadmap 项：**描述缓存按内容 sha 落盘持久化（含 LRU / 容量上�
 | LRU 时钟 | **文件 mtime**：写入即新 mtime；命中 `utimes` touch（置 now）。淘汰按 mtime 升序删最旧 |
 | 引擎形态 | **磁盘即事实**：不加载全量索引、无进程内存镜像。命中 miss 先 `readFile` 探存在；写直写文件 + 触发淘汰；淘汰 `readdir`+`stat` 排序删最旧。跨进程实时可见，零状态同步 |
 | 容量上限 | 硬编码 `maxEntries = 2000` 条 + `maxBytes = 50MB`（条目文件字节和），任一超限即淘汰 LRU 直至双条件满足；**不新增配置面**。做成模块级可变对象（`export const descriptionCacheLimits = { maxEntries, maxBytes }`）供测试注入小值（与 `providersTimeout` 同风格） |
+| 超限条目处置 | **A / 硬上限（超限不入缓存）**：序列化后先按 utf8 字节预检，`payload > maxBytes` 则跳过写入——不写盘、不触发淘汰、**不删除该 key 已有旧文件**。磁盘恒 `total ≤ maxBytes`，不变量无条件成立（与磁盘型缓存 memcached/Squid 的拒绝语义一致，非内存 KV 的临时超限） |
+| 淘汰时序与 protect | **write-then-evict 不变**；`evictDescriptionCache(dir, protectName)` 保护刚写入条目不被本次淘汰删除——除单条超限场景外，也防御同 mtime 平局按文件名裁决时"刚写入条目被自己的淘汰删掉"的边角（粗粒度文件系统时钟 / 同毫秒连续写）。A 策略下可达域变小但该防线仍保留（零成本） |
 | 并发安全 | 复用图片落盘的 tmp+rename 原子写（`<name>.tmp-<uuid>` → rename）；每条目独立文件，多进程并发写同 key 原子幂等；淘汰 best-effort（readdir 快照可能含已被他进程删的文件，unlink 失败忽略） |
 | 失败语义 | 全链路 fail-open：读失败 / JSON 损坏 / shape 非法 / 文件消失 → miss（正常走链重算，重算后再写）；写失败 / tmp 清理失败 / touch 失败 / 淘汰 unlink 失败 → 静默忽略；工具永不因缓存而抛错 |
 | 命中标签 | 沿用入库 modelId（缓存值与磁盘语义一致），不随候选链链首重写 |
@@ -78,21 +88,27 @@ lookup(key):
 ### 写入 + 淘汰（新描述产出后）
 ```
 store(key, { modelId, text }):
+  payload = JSON.stringify({ modelId, text })
+  // 超限预检（A / 硬上限）：单条 > maxBytes 不入缓存
+  // 口径与 evict 的 stat().size 一致：磁盘 utf8 字节，用 Buffer.byteLength 而非 string length
+  if Buffer.byteLength(payload, "utf8") > maxBytes → return   // 不写、不淘汰、不删该 key 旧文件
   mkdir(descDir, { recursive: true, mode: 0o700 })
   tmp = file + ".tmp-" + randomUUID()
-  writeFile(tmp, JSON.stringify({ modelId, text })) → rename(tmp, file)
+  writeFile(tmp, payload) → rename(tmp, file)
   catch → unlink(tmp) best-effort，忽略
-  // 容量淘汰（写后触发）
+  // 容量淘汰（写后触发；protect 本次刚写入的文件）
   entries = readdir(descDir)（过滤 *.json，忽略 tmp）
   stats   = entries.map(stat)  // size + mtime；stat 失败条目跳过
   totalBytes = Σ size；count = stats.length
   while (totalBytes > maxBytes || count > maxEntries):
-     oldest = 当前未被删的 mtime 最小文件
+     oldest = 当前未被删的 mtime 最小文件（跳过 protectName）
      if 无 → break
      unlink(oldest) best-effort；totalBytes -= size；count -= 1
 ```
 best-effort：readdir 快照与 unlink 之间可能已被其它进程淘汰/重写 → unlink ENOENT 忽略；
 极端并发下容量可能短暂超限，收敛于各进程后续写入时再淘汰（缓存非关键路径，可接受）。
+超限预检使「total ≤ maxBytes」在**单条即超限的极值下也无反例**（该条不入缓存，不可能靠删光
+其它条目独留而超限）。
 
 ### 模块级可注入常量（测试用）
 ```
@@ -121,7 +137,10 @@ plugin.test 新增（描述缓存相关块 / 新 describe）：
 6. 容量不超限断言：淘汰后 totalBytes ≤ maxBytes 且 count ≤ maxEntries。
 7. 并发/幂等：同 key 并发两写 → 文件完整（rename 原子）、无 `.tmp-*` 孤儿（对齐图片并发写用例）。
 8. 损坏容错：手写坏 JSON 到命中路径 → miss、正常调链重算；写失败（目标路径被目录占用）fail-open 不抛错。
-9. 既有用例零 diff：快速路径 / URL 下载 / fallback / 空链 / 能力缓存 / chat.message 门控不变。
+9. **单条超限判别用例（A 策略，B/C 会挂、A 通过的用例）**：注入小 maxBytes → 先写一条正常尺寸条目，
+   再把 prompt 行为切成巨 text（单条 > maxBytes）问另一个 question → 该 key **未落盘**、工具照常返回文本、
+   **预置正常条目原封不动**、无 `.tmp-*` 孤儿。
+10. 既有用例零 diff：快速路径 / URL 下载 / fallback / 空链 / 能力缓存 / chat.message 门控不变。
 
 helpers：无需改动（`makeTempDir` 已带 `.git`；非 git 用例沿用注入 XDG_CACHE_HOME 模式）。
 
