@@ -3,7 +3,7 @@
  * 让单元测试无需运行中的 opencode 实例。
  */
 import { createHash } from "node:crypto"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { PluginInput, PluginOptions, ToolContext } from "@opencode-ai/plugin"
@@ -16,9 +16,11 @@ export const TINY_PNG = Buffer.from(
 export const TINY_PNG_DATA_URL = `data:image/png;base64,${TINY_PNG.toString("base64")}`
 export const TINY_PNG_SHA = createHash("sha256").update(TINY_PNG).digest("hex")
 
-/** 临时项目目录（真实落盘可验证）。 */
+/** 临时项目目录（真实落盘可验证）。默认带空 `.git`，使插件按「git 项目」语义落盘到项目内。 */
 export async function makeTempDir(): Promise<string> {
-  return mkdtemp(path.join(tmpdir(), "vision-analyze-test-"))
+  const dir = await mkdtemp(path.join(tmpdir(), "vision-analyze-test-"))
+  await mkdir(path.join(dir, ".git"))
+  return dir
 }
 
 export async function removeDir(dir: string): Promise<void> {

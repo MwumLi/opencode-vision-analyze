@@ -2,10 +2,10 @@
  * opencode-vision-analyze
  *
  * 为「不具备视觉能力的主模型」提供图片解读路由：当用户在消息中附带图片时，
- * 插件把图片落盘到 .opencode/vision/<sha256>.<ext>，并向模型注入一条
- * synthetic 提示（TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具
- * 让指定的视觉模型描述图片。若主模型本身支持图片输入，则不做任何干预，
- * 原图直接发给主模型。
+ * 插件把图片落盘到 vision 目录（git 项目内 → <项目>/.opencode/vision；
+ * 非 git 目录 → 用户级缓存目录），并向模型注入一条 synthetic 提示
+ * （TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具让指定的视觉
+ * 模型描述图片。若主模型本身支持图片输入，则不做任何干预，原图直接发给主模型。
  *
  * 安装方式一（npm）：
  *   {
@@ -51,9 +51,14 @@
  *   虽被删除，但 provider 端已发出的孤儿回合仍可能计入用量。
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
+ * - 图片存储按 git 语义分域：git 项目 → 项目 `.opencode/vision`；非 git 目录 →
+ *   用户级缓存（每次落盘现算）。切换存储范围（如 git init）后旧会话 hint 的
+ *   绝对路径 stale，重贴图即注入新 hint。详见 docs 2026-09-08 设计与 README。
  */
 import { createHash, randomUUID } from "node:crypto"
+import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
+import { homedir } from "node:os"
 import path from "node:path"
 import type { FilePart, TextPart } from "@opencode-ai/sdk"
 import type { Hooks, Plugin, PluginInput, PluginOptions, ToolContext, ToolResult } from "@opencode-ai/plugin"
@@ -90,6 +95,56 @@ const VISION_SYSTEM_PROMPT = [
 
 /** data URL 形如 data:<mime>;base64,<payload> */
 const DATA_URL_PATTERN = /^data:([^;]+);base64,(.+)$/
+
+/**
+ * 判断目录是否位于 git 项目内：从 dir 向上（含自身）逐级找 `.git`
+ * （目录，或 worktree/submodule 的 `.git` 指针文件），到文件系统根为止。
+ * 纯同步、纯内置模块；作为命名导出便于单元测试注入真实临时目录验证。
+ */
+export function isInsideGitRepo(dir: string): boolean {
+  let cur = path.resolve(dir)
+  for (;;) {
+    if (existsSync(path.join(cur, ".git"))) return true
+    const parent = path.dirname(cur)
+    if (parent === cur) return false // 已到文件系统根
+    cur = parent
+  }
+}
+
+/**
+ * 用户级（非 git）图片缓存的平台根：cache 目录 + opencode-vision-analyze/vision。
+ * 空字符串 env 视为未设置（XDG/LOCALAPPDATA 官规：空值=未设置）——避免把 "" 当
+ * 有效根导致 path.join("",…) 产出相对路径、相对进程 cwd 落盘。
+ * darwin 亦接受 $XDG_CACHE_HOME 覆盖（跨平台统一 dotfiles 的宽容超集）。
+ */
+export function userVisionCacheRoot(
+  env: Record<string, string | undefined>,
+  platform: string,
+  home: string,
+): string {
+  const base =
+    platform === "darwin"
+      ? (env.XDG_CACHE_HOME || path.join(home, "Library", "Caches"))
+      : platform === "win32"
+        ? (env.LOCALAPPDATA || path.join(home, "AppData", "Local"))
+        : (env.XDG_CACHE_HOME || path.join(home, ".cache"))
+  return path.join(base, "opencode-vision-analyze", "vision")
+}
+
+/**
+ * 图片存储根：与 opencode 的项目/全局语义对齐——
+ * git 项目内 → <项目>/.opencode/vision（现状）；非 git 目录 → 用户级缓存目录。
+ * 解析一次即可（纯函数，入参可注入以便三平台与 env 覆盖的单测）。
+ */
+export function resolveVisionDir(
+  inputDir: string,
+  env: Record<string, string | undefined>,
+  platform: string,
+  home: string,
+): string {
+  if (isInsideGitRepo(inputDir)) return path.join(path.resolve(inputDir), ".opencode", "vision")
+  return userVisionCacheRoot(env, platform, home)
+}
 
 /**
  * http(s) 下载图片的大小上限（20 MB）。提示注入可让模型指向超大图片，
@@ -289,10 +344,32 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     `[Image: ${basename} — described by ${modelId}]\n${text}`
 
   /**
-   * 下载 http(s) URL 指向的图片并落盘到 <visionDir>/<sha256><ext>：
-   * 与 chat.message 落盘路径一致，内容哈希命名天然去重。
-   * 扩展名不受支持、HTTP 非 2xx、网络失败（含 30 秒下载超时）、超过
-   * 20 MB 下载上限（content-length 预检 + 读后复核）都返回 { error }，
+   * 把图片字节内容原子落盘并返回最终 filepath。每次调用现算存储根
+   * （git 项目 → 项目 .opencode/vision；非 git → 用户级缓存，见 resolveVisionDir）：
+   * 运行中存储范围变化（如 git init）从下一条图片起即时生效，无需重启。
+   * 先写 `<sha><ext>.tmp-<uuid>` 再 rename：共享目录（用户级/多实例）并发写同一 sha
+   * 时内容寻址下原子幂等；失败先清理临时文件再抛错，避免孤儿 tmp 累积。
+   */
+  const persistImageBytes = async (bytes: Buffer, ext: string): Promise<string> => {
+    const dir = resolveVisionDir(input.directory, process.env, process.platform, homedir())
+    const sha = createHash("sha256").update(bytes).digest("hex")
+    const filepath = path.join(dir, `${sha}${ext}`)
+    const tmpPath = path.join(dir, `${sha}${ext}.tmp-${randomUUID()}`)
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+    try {
+      await fs.writeFile(tmpPath, bytes)
+      await fs.rename(tmpPath, filepath)
+    } catch (error) {
+      await fs.unlink(tmpPath).catch(() => {})
+      throw error
+    }
+    return filepath
+  }
+
+  /**
+   * 下载 http(s) URL 指向的图片并落盘（内容哈希命名天然去重，写盘细节见
+   * persistImageBytes）。扩展名不受支持、HTTP 非 2xx、网络失败（含 30 秒下载
+   * 超时）、超过 20 MB 下载上限（content-length 预检 + 读后复核）都返回 { error }，
    * 由调用方转成可读的错误文字。
    */
   const downloadImage = async (url: string): Promise<{ filepath: string } | { error: string }> => {
@@ -314,12 +391,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       if (bytes.length > MAX_DOWNLOAD_BYTES) {
         return { error: "image exceeds 20 MB download limit" }
       }
-      const sha = createHash("sha256").update(bytes).digest("hex")
-      const dir = path.join(input.directory, ".opencode", "vision")
-      await fs.mkdir(dir, { recursive: true })
-      const filepath = path.join(dir, `${sha}${ext}`)
-      await fs.writeFile(filepath, bytes)
-      return { filepath }
+      return { filepath: await persistImageBytes(bytes, ext) }
     } catch (error) {
       return { error: errText(error) }
     }
@@ -492,8 +564,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   }
 
   /**
-   * 把一个图片 file part 落盘到 <directory>/.opencode/vision/<sha256>.<ext>。
-   * 文件名用内容哈希，天然去重（同一张图多次发送只落一份）。
+   * 把一个图片 file part 落盘（内容哈希命名去重，写盘细节见 persistImageBytes）。
    * 返回落盘信息；MIME 不受支持或 URL 不是 base64 data URL 时返回 undefined。
    */
   const persistImage = async (part: FilePart): Promise<{ filepath: string } | undefined> => {
@@ -503,12 +574,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     if (!match) return undefined
     try {
       const bytes = Buffer.from(match[2], "base64")
-      const sha = createHash("sha256").update(bytes).digest("hex")
-      const dir = path.join(input.directory, ".opencode", "vision")
-      await fs.mkdir(dir, { recursive: true })
-      const filepath = path.join(dir, `${sha}${ext}`)
-      await fs.writeFile(filepath, bytes)
-      return { filepath }
+      return { filepath: await persistImageBytes(bytes, ext) }
     } catch {
       // fail-open 原则：图片落盘失败（EACCES/ENOSPC 等）只是少了 vision_analyze
       // 提示，不应让用户消息落库失败。返回 undefined，外层逐图跳过。

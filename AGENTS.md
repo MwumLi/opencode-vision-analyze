@@ -42,3 +42,11 @@ npm version patch
 ## 测试
 
 - `bun test`（单元测试，stub client，无需运行 opencode）；`bun run typecheck`；`bun run build`。
+
+## 文档与存档约定
+
+- 已定稿的历史 spec/plan（`docs/superpowers/specs|plans/`）属**历史存档，只读**：
+  除该文档自身所在的那一次迭代内（同一迭代、未合入）外，**不再修改**。
+- 新需求/迭代一律以**新日期命名**的 spec（`docs/superpowers/specs/YYYY-MM-DD-*.md`）与 plan 落盘；
+  确需关联旧文档时只加链接引用，不回改旧文、不在旧档头部叠注释。
+- 单次迭代内对新产生的 spec/plan 可正常修改直至定稿；定稿/合入后即冻结为存档。
