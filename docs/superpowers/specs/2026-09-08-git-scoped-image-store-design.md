@@ -84,7 +84,8 @@ plugin.test 新增：
   用户级缓存 `…/opencode-vision-analyze/vision`）；建议 git 项目把 `.opencode/vision/` 加入 `.gitignore`；
   注明切换后旧 hint 路径失效、重贴即可。Roadmap 现有「LRU/size cap for description cache」扩展为
   「按内容 sha 落盘持久化描述缓存（含 LRU/容量，独立立项）」。
-- `2026-09-05-…design.md`：落盘决策行更新 + 追加 2026-09-08 变更记录行。
+- 历史 spec（`2026-09-05-…design.md` 等）属只读存档，**不回改**；本行为以本文档为唯一契约，
+  旧档如需理解演进仅作链接引用。
 
 ## 验证门禁
 

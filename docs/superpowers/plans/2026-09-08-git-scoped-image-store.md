@@ -23,7 +23,7 @@
 | `test/helpers.ts` | 改 | `makeTempDir` 内创建空 `.git` 目录 |
 | `test/plugin.test.ts` | 改 | 新增 git 检测/目录解析/端到端/并发写用例 |
 | `README.md`、`README.zh.md` | 改 | 存储语义说明 + gitignore 建议 + Roadmap 措辞 |
-| `docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md` | 改 | 落盘决策行 + 变更记录 |
+| `docs/superpowers/specs/2026-09-08-git-scoped-image-store-design.md` | 改 | 定稿（去草稿状态行） |
 
 ---
 
@@ -57,10 +57,10 @@
 
 ## Task 4：文档同步
 
-**Files**: `README.md`、`README.zh.md`、`docs/superpowers/specs/2026-09-05-opencode-vision-analyze-design.md`、本 spec
+**Files**: `README.md`、`README.zh.md`、本 spec
 
 - Step 1: README 中英存储语义 + gitignore 建议 + 旧 hint stale 说明；Roadmap 描述缓存落盘措辞；
-  `2026-09-05` spec 落盘行 + 变更记录；本 spec 状态行已定稿。
+  本 spec 状态行已定稿。**不回改历史 spec**（只读存档）。
 - Step 2: `bun run typecheck && bun test && bun run build` 最终全绿。
 - commit: `docs: document git-scoped image storage and roadmap persistent description cache`
 
