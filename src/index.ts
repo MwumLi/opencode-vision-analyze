@@ -108,7 +108,12 @@ export function isInsideGitRepo(dir: string): boolean {
   }
 }
 
-/** 用户级（非 git）图片缓存的平台根：cache 目录 + opencode-vision-analyze/vision。 */
+/**
+ * 用户级（非 git）图片缓存的平台根：cache 目录 + opencode-vision-analyze/vision。
+ * 空字符串 env 视为未设置（XDG/LOCALAPPDATA 官规：空值=未设置）——避免把 "" 当
+ * 有效根导致 path.join("",…) 产出相对路径、相对进程 cwd 落盘。
+ * darwin 亦接受 $XDG_CACHE_HOME 覆盖（跨平台统一 dotfiles 的宽容超集）。
+ */
 export function userVisionCacheRoot(
   env: Record<string, string | undefined>,
   platform: string,
@@ -116,10 +121,10 @@ export function userVisionCacheRoot(
 ): string {
   const base =
     platform === "darwin"
-      ? (env.XDG_CACHE_HOME ?? path.join(home, "Library", "Caches"))
+      ? (env.XDG_CACHE_HOME || path.join(home, "Library", "Caches"))
       : platform === "win32"
-        ? (env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"))
-        : (env.XDG_CACHE_HOME ?? path.join(home, ".cache"))
+        ? (env.LOCALAPPDATA || path.join(home, "AppData", "Local"))
+        : (env.XDG_CACHE_HOME || path.join(home, ".cache"))
   return path.join(base, "opencode-vision-analyze", "vision")
 }
 
@@ -134,7 +139,7 @@ export function resolveVisionDir(
   platform: string,
   home: string,
 ): string {
-  if (isInsideGitRepo(inputDir)) return path.join(inputDir, ".opencode", "vision")
+  if (isInsideGitRepo(inputDir)) return path.join(path.resolve(inputDir), ".opencode", "vision")
   return userVisionCacheRoot(env, platform, home)
 }
 

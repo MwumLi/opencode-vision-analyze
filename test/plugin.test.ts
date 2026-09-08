@@ -928,6 +928,18 @@ describe("图片存储分域（git / 用户级）", () => {
     }
   })
 
+  test("isInsideGitRepo：深层子目录上溯命中祖先 .git 文件 → true", async () => {
+    const noGit = await makeNoGitDir()
+    try {
+      const sub = path.join(noGit, "a", "b", "c")
+      await mkdir(sub, { recursive: true })
+      await writeFile(path.join(noGit, ".git"), "gitdir: /elsewhere/.git/worktrees/wt\n")
+      expect(isInsideGitRepo(sub)).toBe(true) // 自 c 向上：c → b → a → 祖先(noGit) 的 .git 文件
+    } finally {
+      await removeDir(noGit)
+    }
+  })
+
   test("isInsideGitRepo：无 .git 的目录（到根目录为止）→ false", async () => {
     const noGit = await makeNoGitDir()
     try {
@@ -959,9 +971,37 @@ describe("图片存储分域（git / 用户级）", () => {
       expect(resolveVisionDir(noGit, {}, "darwin", "/Users/u")).toBe(
         path.join("/Users/u", "Library", "Caches", "opencode-vision-analyze", "vision"),
       )
+      // macOS + XDG_CACHE_HOME 覆盖（跨平台 dotfiles 宽容超集）
+      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "/x/cache" }, "darwin", "/Users/u")).toBe(
+        path.join("/x/cache", "opencode-vision-analyze", "vision"),
+      )
       // Windows：%LOCALAPPDATA% 覆盖
       expect(resolveVisionDir(noGit, { LOCALAPPDATA: "C:\\lapp" }, "win32", "C:\\Users\\u")).toBe(
         path.join("C:\\lapp", "opencode-vision-analyze", "vision"),
+      )
+      // Windows：无 %LOCALAPPDATA% → 默认 ~/AppData/Local
+      expect(resolveVisionDir(noGit, {}, "win32", "C:\\Users\\u")).toBe(
+        path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "vision"),
+      )
+    } finally {
+      await removeDir(noGit)
+    }
+  })
+
+  test("resolveVisionDir：缓存根 env 为空串 → 视为未设置、回退默认平台路径", async () => {
+    const noGit = await makeNoGitDir()
+    try {
+      // Linux：XDG_CACHE_HOME="" → ~/.cache（空串不得产出相对路径）
+      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "" }, "linux", "/home/u")).toBe(
+        path.join("/home/u", ".cache", "opencode-vision-analyze", "vision"),
+      )
+      // macOS：XDG_CACHE_HOME="" → ~/Library/Caches
+      expect(resolveVisionDir(noGit, { XDG_CACHE_HOME: "" }, "darwin", "/Users/u")).toBe(
+        path.join("/Users/u", "Library", "Caches", "opencode-vision-analyze", "vision"),
+      )
+      // Windows：LOCALAPPDATA="" → ~/AppData/Local
+      expect(resolveVisionDir(noGit, { LOCALAPPDATA: "" }, "win32", "C:\\Users\\u")).toBe(
+        path.join("C:\\Users\\u", "AppData", "Local", "opencode-vision-analyze", "vision"),
       )
     } finally {
       await removeDir(noGit)
