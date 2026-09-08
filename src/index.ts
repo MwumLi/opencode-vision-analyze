@@ -7,29 +7,6 @@
  * （TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具让指定的视觉
  * 模型描述图片。若主模型本身支持图片输入，则不做任何干预，原图直接发给主模型。
  *
- * 安装方式一（npm）：
- *   {
- *     "plugin": [["opencode-vision-analyze", { "models": ["provider/vision-model"] }]]
- *   }
- *
- * 安装方式二（curl 下载单文件，免 npm）：
- *   mkdir -p .opencode
- *   curl -fsSL <raw-url>/src/index.ts -o .opencode/vision-analyze.ts
- *   {
- *     "plugin": [["./.opencode/vision-analyze.ts", { "models": ["provider/vision-model"] }]]
- *   }
- *
- * 选项：
- *   - models（可选，缺省/空数组 = 自动模式）：有序视觉候选数组，如
- *     ["provider-a/m1", "provider-b/m2"]；单模型写 ["provider/model"] 即可
- *   - unlisted_fallback（可选，默认 false）：显式候选耗尽后自动续接未列出的 image-capable 模型
- *   - free_first（可选，默认 false）：自动发现档序反转（custom/匿名免费源优先，默认 config 优先）
- *   - timeout_ms：单候选子会话请求的超时毫秒数（正数，默认 60000）
- *
- * 候选链语义：显式 models 恒在链首；缺省/空数组 → 自动发现全部 image-capable
- * 模型并按 Provider.source 档序排列。链上候选逐个尝试，成功即止，全败聚合报错。
- * 描述子会话的模型属于候选链，chat.message 递归防护以整链成员为集。
- *
  * 工作方式（vision_analyze 工具路径）：主模型调用 vision_analyze 时，插件
  * 创建一个 parentID 挂在当前会话下的临时子会话（不进会话列表、不生成
  * 标题、禁用全部工具），把原图以 data URL 发给视觉模型，取回描述文字后
@@ -43,17 +20,8 @@
  * 类型依赖仅 @opencode-ai/plugin 与 @opencode-ai/sdk 的 type import。
  *
  * 已知限制：
- * - SSRF 面：downloadImage 的 fetch 跟随重定向、不拦截私网/云元数据地址。
- *   本地单用户 CLI 的信任级别下可接受；生产多租户环境使用前应加私网
- *   地址拦截。
- * - 中止不传导：用户中止不会取消进行中的下载/子会话请求，最长空跑至
- *   各自的 deadline（下载 30 秒、子会话 timeout_ms）；超时/中止后子会话
- *   虽被删除，但 provider 端已发出的孤儿回合仍可能计入用量。
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
- * - 图片存储按 git 语义分域：git 项目 → 项目 `.opencode/vision`；非 git 目录 →
- *   用户级缓存（每次落盘现算）。切换存储范围（如 git init）后旧会话 hint 的
- *   绝对路径 stale，重贴图即注入新 hint。详见 docs 2026-09-08 设计与 README。
  */
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
@@ -79,6 +47,24 @@ const MIME_EXT: Record<string, string> = {
   "image/gif": ".gif",
   "image/webp": ".webp",
 }
+
+/**
+ * 内部超时错误类型（name = "DeadlineError"）。
+ * 与 AbortError 并列可判别：超时路径（providers 查询 / 子会话请求）据此判断
+ * "底层请求可能仍在飞"，供调用方决定是否需要 abort 取消（见 attemptModel）。
+ */
+class DeadlineError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "DeadlineError"
+  }
+}
+
+/**
+ * `config.providers()` 能力查询的超时预算（毫秒）。做成可改写对象（而非常量/选项）：
+ * 避免选项膨胀；测试把 ms 调小即可缩短等待（TS 不允许对 import 的 let 绑定赋值）。
+ */
+export const providersTimeout = { ms: 5000 }
 
 /**
  * 视觉子会话使用的系统提示词。
@@ -219,31 +205,51 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   }
 
   /**
+   * 无 ToolContext 的超时原语：到期以 DeadlineError(timeoutMessage) 拒绝。
+   * 与 withDeadline 的差别是它不感知 abort——能力查询（providers）等无 ctx 的
+   * 请求只关心"别永久挂起"，不需要监听用户中止；子会话请求由 withDeadline 组合
+   * abort 信号后复用它，保证全插件只有一套计时机制。
+   */
+  const withTimeout = async <T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const guard = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new DeadlineError(timeoutMessage)), ms)
+    })
+    try {
+      return await Promise.race([promise, guard])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  /**
    * 给子会话请求加超时与 abort 保护：任一触发即让 Promise 以错误结束，
-   * 不再等待底层请求；finally 中清理 timer 与监听器，避免泄漏。
+   * 不再等待底层请求；超时复用 withTimeout（DeadlineError），abort 仍以
+   * AbortError 拒绝；finally 中清理 timer 与监听器，避免泄漏。
    */
   const withDeadline = <T>(promise: Promise<T>, ctx: ToolContext): Promise<T> => {
-    let timer: ReturnType<typeof setTimeout> | undefined
+    // ctx.abort 已中止时 abort 事件不会再触发，必须立即拒绝，
+    // 否则 race 只能干等 timer 超时。
+    if (ctx.abort.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"))
     let onAbort: (() => void) | undefined
-    const guarded = new Promise<never>((_, reject) => {
-      // ctx.abort 已中止时 abort 事件不会再触发，必须立即拒绝，
-      // 否则 race 只能干等 timer 超时。
-      if (ctx.abort.aborted) {
-        reject(new DOMException("Aborted", "AbortError"))
-        return
-      }
-      timer = setTimeout(() => reject(new Error(`vision model call timed out after ${timeoutMs}ms`)), timeoutMs)
+    const abortGuard = new Promise<never>((_, reject) => {
       onAbort = () => reject(new DOMException("Aborted", "AbortError"))
       ctx.abort.addEventListener("abort", onAbort, { once: true })
     })
-    return Promise.race([promise, guarded]).finally(() => {
-      if (timer) clearTimeout(timer)
+    return withTimeout(
+      Promise.race([promise, abortGuard]),
+      timeoutMs,
+      `vision model call timed out after ${timeoutMs}ms`,
+    ).finally(() => {
       if (onAbort) ctx.abort.removeEventListener("abort", onAbort)
     })
   }
 
   /** 判断错误是否为中止信号（AbortError），供 attemptModel 标记 / 链循环中止整链。 */
   const isAbortError = (error: unknown): boolean => error instanceof Error && error.name === "AbortError"
+
+  /** 判断错误是否为本插件超时信号（DeadlineError）——与 AbortError 并列，表示"请求到期被本地掐断"。 */
+  const isDeadlineError = (error: unknown): boolean => error instanceof Error && error.name === "DeadlineError"
 
   /**
    * 单个候选的尝试：创建子会话（parentID 挂当前会话）→ 用该候选模型描述 →
@@ -260,6 +266,9 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   ): Promise<{ ok: true; text: string } | { ok: false; error: string; aborted?: boolean }> => {
     const dataURL = `data:${image.mime};base64,${image.bytes.toString("base64")}`
     let subID: string | undefined
+    // "回合可能仍在飞"标记：请求被本地 deadline（超时）或用户 abort 掐断时置位，
+    // finally 据此先 abort 子会话（取消 provider 端孤儿回合）再 delete。
+    let endedByDeadline = false
     try {
       const created = await withDeadline(
         input.client.session.create({ body: { parentID: ctx.sessionID, title: "vision analysis" } }),
@@ -298,11 +307,18 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       if (!text) return { ok: false, error: "vision model returned no text" }
       return { ok: true, text }
     } catch (error) {
-      // 异常（超时 / 中止 / 底层抛错）同样收敛为失败结果；aborted 标记交由链循环判断
+      // 异常（超时 / 中止 / 底层抛错）同样收敛为失败结果；aborted 标记交由链循环判断。
+      // 超时与中止都意味着底层请求可能仍在飞 → 需要先 abort 再 delete。
+      endedByDeadline = isDeadlineError(error) || isAbortError(error)
       return { ok: false, error: errText(error), aborted: isAbortError(error) }
     } finally {
       if (subID) {
         subSessions.delete(subID)
+        // 先 abort（best-effort，取消 provider 端孤儿回合）再 delete；
+        // 成功/普通失败路径 turn 已自然结束，无需 abort。
+        if (endedByDeadline) {
+          await input.client.session.abort({ path: { id: subID } }).catch(() => {})
+        }
         await input.client.session.delete({ path: { id: subID } }).catch(() => {})
       }
     }
@@ -371,8 +387,17 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * persistImageBytes）。扩展名不受支持、HTTP 非 2xx、网络失败（含 30 秒下载
    * 超时）、超过 20 MB 下载上限（content-length 预检 + 读后复核）都返回 { error }，
    * 由调用方转成可读的错误文字。
+   *
+   * 中止传导：abort（用户中止）与 30 秒超时共同驱动一个 AbortController——
+   * 中止即刻断请求，不空跑满超时；pre-abort 直接放弃、不发请求。手动组合信号
+   * 而非 AbortSignal.any()：engines node>=18（any 需 18.17+/20.3+），且与
+   * withDeadline 的 addEventListener 风格同构。错误以 AbortError/超时形式落入
+   * catch，统一转可读文字。
    */
-  const downloadImage = async (url: string): Promise<{ filepath: string } | { error: string }> => {
+  const downloadImage = async (
+    url: string,
+    abort: AbortSignal,
+  ): Promise<{ filepath: string } | { error: string }> => {
     try {
       // URL 解析与扩展名提取放在 try 内：畸形 URL 在 new URL 处抛错时，
       // 错误以 "Image download failed" 前缀返回，而不是漏到外层的
@@ -380,18 +405,32 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       const ext = path.extname(new URL(url).pathname).toLowerCase()
       const mime = EXT_MIME[ext]
       if (!mime) return { error: `unsupported image URL extension: ${ext || "(none)"}` }
-      const response = await fetch(url, { signal: AbortSignal.timeout(30_000) })
-      if (!response.ok) return { error: `HTTP ${response.status}` }
-      // 头字段缺失时 Number(null) 为 NaN，比较结果为 false，自然放行到读后复核。
-      if (Number(response.headers.get("content-length")) > MAX_DOWNLOAD_BYTES) {
-        return { error: "image exceeds 20 MB download limit" }
+      // pre-abort：已中止则不必发请求，直接以 Aborted 收尾
+      if (abort.aborted) return { error: "Aborted" }
+
+      const controller = new AbortController()
+      const onAbort = () => controller.abort()
+      abort.addEventListener("abort", onAbort, { once: true })
+      const timer = setTimeout(() => controller.abort(), 30_000)
+      try {
+        // 整个下载（fetch 响应头 + arrayBuffer 读 body）都在同一 guard 内：
+        // 30 秒预算与用户中止都覆盖到 body 读取阶段；收尾再清 timer/listener。
+        const response = await fetch(url, { signal: controller.signal })
+        if (!response.ok) return { error: `HTTP ${response.status}` }
+        // 头字段缺失时 Number(null) 为 NaN，比较结果为 false，自然放行到读后复核。
+        if (Number(response.headers.get("content-length")) > MAX_DOWNLOAD_BYTES) {
+          return { error: "image exceeds 20 MB download limit" }
+        }
+        const bytes = Buffer.from(await response.arrayBuffer())
+        // 复核实际字节数：chunked 等无 content-length 的响应只有读后才能判大小。
+        if (bytes.length > MAX_DOWNLOAD_BYTES) {
+          return { error: "image exceeds 20 MB download limit" }
+        }
+        return { filepath: await persistImageBytes(bytes, ext) }
+      } finally {
+        clearTimeout(timer)
+        abort.removeEventListener("abort", onAbort)
       }
-      const bytes = Buffer.from(await response.arrayBuffer())
-      // 复核实际字节数：chunked 等无 content-length 的响应只有读后才能判大小。
-      if (bytes.length > MAX_DOWNLOAD_BYTES) {
-        return { error: "image exceeds 20 MB download limit" }
-      }
-      return { filepath: await persistImageBytes(bytes, ext) }
     } catch (error) {
       return { error: errText(error) }
     }
@@ -425,7 +464,10 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     try {
       const question = args.question?.trim() || "Describe this image in full detail."
       // http(s) URL：先下载到本地 vision 目录，再统一走磁盘加载路径。
-      const download = /^https?:\/\//i.test(args.image_path) ? await downloadImage(args.image_path) : undefined
+      // ctx.abort 传入下载：用户中止即刻断下载（含 pre-abort 不再发请求）。
+      const download = /^https?:\/\//i.test(args.image_path)
+        ? await downloadImage(args.image_path, ctx.abort)
+        : undefined
       if (download && "error" in download) {
         return { title, output: `Image download failed: ${download.error}` }
       }
@@ -483,7 +525,11 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     const cached = imageCapable.get(key)
     if (cached !== undefined) return cached
     try {
-      const result = await input.client.config.providers()
+      const result = await withTimeout(
+        input.client.config.providers(),
+        providersTimeout.ms,
+        `config.providers() timed out after ${providersTimeout.ms}ms`,
+      )
       // HTTP 非 2xx 时 openapi-fetch 不抛错而是返回 { error }（data 为空）。
       // 「查询失败」不能缓存成 false——那是一次瞬时故障而非「确认不支持」，
       // 缓存会永久关闭能力门控；本次保守返回 false，下次再重试。
@@ -535,7 +581,11 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    */
   const listImageCapableModels = async (): Promise<Array<{ providerID: string; modelID: string }>> => {
     try {
-      const result = await input.client.config.providers()
+      const result = await withTimeout(
+        input.client.config.providers(),
+        providersTimeout.ms,
+        `config.providers() timed out after ${providersTimeout.ms}ms`,
+      )
       if (!result.data) return []
       const found: Array<{ providerID: string; modelID: string; tier: number }> = []
       for (const provider of result.data.providers ?? []) {

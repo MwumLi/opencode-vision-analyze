@@ -77,6 +77,8 @@ export type SessionCalls = {
   create: Array<{ parentID?: string; title?: string }>
   prompt: Array<{ id: string; model?: { providerID: string; modelID: string }; parts: unknown[] }>
   deleted: string[]
+  /** session.abort 被调用的子会话 id（R2：超时/中止路径先 abort 再 delete）。 */
+  aborted: string[]
   /** config.providers 被调用次数（断言能力查询缓存时使用）。 */
   providers: number
 }
@@ -89,7 +91,7 @@ export type SessionCalls = {
  * - session.delete：记录被删 id
  */
 export function makeStubClient(input?: { providersResult?: StubProvidersResult }) {
-  const calls: SessionCalls = { create: [], prompt: [], deleted: [], providers: 0 }
+  const calls: SessionCalls = { create: [], prompt: [], deleted: [], aborted: [], providers: 0 }
   let subSessionSeq = 0
   let providersResult: StubProvidersResult | (() => Promise<StubProvidersResult>) =
     input?.providersResult ?? {
@@ -141,6 +143,10 @@ export function makeStubClient(input?: { providersResult?: StubProvidersResult }
       },
       delete: async (args: { path: { id: string } }) => {
         calls.deleted.push(args.path.id)
+        return { data: true }
+      },
+      abort: async (args: { path: { id: string } }) => {
+        calls.aborted.push(args.path.id)
         return { data: true }
       },
     },

@@ -31,7 +31,7 @@ import {
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
-import { isInsideGitRepo, resolveVisionDir } from "../src/index"
+import { isInsideGitRepo, resolveVisionDir, providersTimeout } from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
 let dir: string
@@ -447,6 +447,9 @@ describe("vision 候选链 fallback（describeWithChain）", () => {
     // 只尝试了首候选一次，没有推进 other-vision
     expect(client.calls.prompt.length).toBe(1)
     expect(client.calls.create.length).toBe(1)
+    // R2：运行中用户 abort → 先 abort 再删除该子会话
+    expect(client.calls.aborted).toEqual(["ses_sub_1"])
+    expect(client.calls.deleted).toContain("ses_sub_1")
   })
 
   test("空链：无 image-capable 模型时返回友好错误且不建子会话", async () => {
@@ -815,9 +818,104 @@ describe("URL 图片下载", () => {
       restore()
     }
   })
+
+  test("中止传导：pre-abort → 不发起 URL 下载", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    let fetched = 0
+    const restore = mockFetch((async () => {
+      fetched += 1
+      return new Response(TINY_PNG)
+    }) as typeof fetch)
+    try {
+      const controller = new AbortController()
+      controller.abort()
+      const result = await getAnalyze(hooks)(
+        { image_path: "http://example.com/pic.png", question: "x" },
+        toolCtx(controller.signal),
+      )
+      // 已中止则根本不发请求；下载失败文字透传 Aborted
+      expect(fetched).toBe(0)
+      expect(result.output).toContain("Image download failed: Aborted")
+    } finally {
+      restore()
+    }
+  })
+
+  test("中止传导：下载进行中 abort → 立即中断请求", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    let fetchSignal: AbortSignal | undefined
+    const restore = mockFetch(((_, init) => {
+      fetchSignal = init?.signal ?? undefined
+      return new Promise<Response>((_resolve, reject) => {
+        fetchSignal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        )
+      })
+    }) as typeof fetch)
+    try {
+      const controller = new AbortController()
+      const pending = getAnalyze(hooks)(
+        { image_path: "http://example.com/pic.png", question: "x" },
+        toolCtx(controller.signal),
+      )
+      // 等 fetch 已被调用、signal 已传入下载请求
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(fetchSignal).toBeDefined()
+      controller.abort()
+      const result = await pending
+
+      // abort 传导到下载请求：signal 已中止、结果透传 Aborted、不建子会话
+      expect(fetchSignal?.aborted).toBe(true)
+      expect(result.output).toContain("Image download failed: Aborted")
+      expect(client.calls.create.length).toBe(0)
+    } finally {
+      restore()
+    }
+  })
 })
 
 describe("超时 / 中止 / 容错", () => {
+  test("R1：providers 能力查询挂起 → 超时降级（不永久 stall、不注入 hint、空链 memoize）", async () => {
+    const client = makeStubClient()
+    // providers 永不 resolve：模拟能力查询挂起
+    client.setProvidersResult(() => new Promise(() => {}))
+    const original = providersTimeout.ms
+    providersTimeout.ms = 25
+    try {
+      const { hooks } = await loadPlugin(makePluginInput(dir, client), {} as PluginOptions) // auto 模式
+      const out = chatOutput([imagePart()])
+      const started = Date.now()
+      // model 缺省（等价 SDK/TUI 首条消息）：递归防护与能力门控都不查询，只走 resolveChain 一次
+      await hooks["chat.message"](chatInput({ sessionID: "ses_1" }), out)
+      const elapsed = Date.now() - started
+
+      // 空链降级：不注入 hint
+      const hintTexts = out.parts
+        .map((p) => (p as { text?: string }).text)
+        .filter((t): t is string => typeof t === "string" && t.includes("vision_analyze"))
+      expect(hintTexts).toHaveLength(0)
+      // 超时降级而非永久挂起：等满超时后正常返回
+      expect(elapsed).toBeGreaterThanOrEqual(20)
+      expect(elapsed).toBeLessThan(1000)
+      expect(client.calls.providers).toBe(1)
+
+      // 第二次同消息：空链被 memoize → 不再发起 providers 查询、不 stall
+      const out2 = chatOutput([imagePart()])
+      await hooks["chat.message"](chatInput({ sessionID: "ses_1" }), out2)
+      expect(client.calls.providers).toBe(1)
+      const hintTexts2 = out2.parts
+        .map((p) => (p as { text?: string }).text)
+        .filter((t): t is string => typeof t === "string" && t.includes("vision_analyze"))
+      expect(hintTexts2).toHaveLength(0)
+    } finally {
+      providersTimeout.ms = original
+    }
+  })
+
   test("超时：timeout_ms 到期后返回超时错误并清理子会话", async () => {
     const client = makeStubClient()
     client.setPromptBehavior(() => new Promise(() => {}))
@@ -838,6 +936,54 @@ describe("超时 / 中止 / 容错", () => {
     expect(result.output).toContain("vision model call timed out after 10ms")
     // 超时路径的 finally 仍会删除子会话
     expect(client.calls.deleted).toContain("ses_sub_1")
+  })
+
+  test("R2：超时路径先 abort 子会话再 delete（取消孤儿回合）", async () => {
+    const client = makeStubClient()
+    client.setPromptBehavior(() => new Promise(() => {}))
+    // 本地记录 abort/delete 的先后顺序（stub 默认实现只分别入列，无法跨数组断言顺序）
+    const order: string[] = []
+    const rawAbort = client.session.abort.bind(client.session)
+    const rawDelete = client.session.delete.bind(client.session)
+    client.session.abort = async (args: { path: { id: string } }) => {
+      order.push(`abort:${args.path.id}`)
+      return rawAbort(args)
+    }
+    client.session.delete = async (args: { path: { id: string } }) => {
+      order.push(`delete:${args.path.id}`)
+      return rawDelete(args)
+    }
+
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+      models: ["test/vision-model"],
+      timeout_ms: 10,
+    })
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+    const result = await getAnalyze(hooks)(
+      { image_path: persistedPath(), question: "x" },
+      toolCtx(new AbortController().signal),
+    )
+
+    expect(result.output).toContain("vision model call timed out after 10ms")
+    expect(client.calls.aborted).toContain("ses_sub_1")
+    expect(client.calls.deleted).toContain("ses_sub_1")
+    expect(order).toEqual(["abort:ses_sub_1", "delete:ses_sub_1"])
+  })
+
+  test("R2：成功路径不 abort 子会话", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    await mkdir(path.dirname(persistedPath()), { recursive: true })
+    await writeFile(persistedPath(), TINY_PNG)
+
+    const result = await getAnalyze(hooks)(
+      { image_path: persistedPath(), question: "x" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(result.output).toContain("described by test/vision-model")
+    expect(client.calls.deleted).toContain("ses_sub_1")
+    expect(client.calls.aborted).toHaveLength(0)
   })
 
   test("预先中止的 signal：立即以 Aborted 结束", async () => {
