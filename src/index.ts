@@ -10,7 +10,10 @@
  * 工作方式（vision_analyze 工具路径）：主模型调用 vision_analyze 时，插件
  * 创建一个 parentID 挂在当前会话下的临时子会话（不进会话列表、不生成
  * 标题、禁用全部工具），把原图以 data URL 发给视觉模型，取回描述文字后
- * 删除子会话并返回描述。同一张图 + 同一问题的描述按内容哈希缓存。
+ * 删除子会话并返回描述。同一张图 + 同一问题的描述按「<图片sha256>:<问题>」
+ * 键缓存到**用户级共享目录**（<cache>/opencode-vision-analyze/descriptions，
+ * 每条目一文件、mtime 作 LRU 时钟、2000 条 / 50MB 双上限、单条超限不入缓存）——
+ * 跨项目/跨进程/插件重启后同图同问题只描述一次。
  * image_path 除了绝对路径也接受 http(s) URL：先下载落盘到同一 vision
  * 目录（内容哈希命名，天然与附件落盘去重），再走统一的磁盘加载路径。
  * 主模型本身支持图片输入时走快速路径：不做子会话描述，直接把原图作为
@@ -98,12 +101,12 @@ export function isInsideGitRepo(dir: string): boolean {
 }
 
 /**
- * 用户级（非 git）图片缓存的平台根：cache 目录 + opencode-vision-analyze/vision。
+ * 用户级 cache 的平台根（不带应用子目录）：cache 目录 + opencode-vision-analyze。
  * 空字符串 env 视为未设置（XDG/LOCALAPPDATA 官规：空值=未设置）——避免把 "" 当
  * 有效根导致 path.join("",…) 产出相对路径、相对进程 cwd 落盘。
  * darwin 亦接受 $XDG_CACHE_HOME 覆盖（跨平台统一 dotfiles 的宽容超集）。
  */
-export function userVisionCacheRoot(
+export function userCacheRootBase(
   env: Record<string, string | undefined>,
   platform: string,
   home: string,
@@ -114,7 +117,18 @@ export function userVisionCacheRoot(
       : platform === "win32"
         ? (env.LOCALAPPDATA || path.join(home, "AppData", "Local"))
         : (env.XDG_CACHE_HOME || path.join(home, ".cache"))
-  return path.join(base, "opencode-vision-analyze", "vision")
+  return path.join(base, "opencode-vision-analyze")
+}
+
+/**
+ * 用户级（非 git）图片缓存的平台根：cache 目录 + opencode-vision-analyze/vision。
+ */
+export function userVisionCacheRoot(
+  env: Record<string, string | undefined>,
+  platform: string,
+  home: string,
+): string {
+  return path.join(userCacheRootBase(env, platform, home), "vision")
 }
 
 /**
@@ -130,6 +144,32 @@ export function resolveVisionDir(
 ): string {
   if (isInsideGitRepo(inputDir)) return path.join(path.resolve(inputDir), ".opencode", "vision")
   return userVisionCacheRoot(env, platform, home)
+}
+
+/**
+ * 描述缓存的持久化目录：恒走用户级共享 cache（<cache>/opencode-vision-analyze/descriptions），
+ * **与 git / 非 git 分域无关**。描述缓存键是「图片内容 sha + 问题」，与项目解耦，放用户级
+ * 目录才能在跨项目 / 跨进程 / 重启后共享同一份"同图同问题只描述一次"的结果。
+ * 纯函数（入参注入 env/platform/homedir，便于三平台 + 空串 env 回退的单测）。
+ */
+export function resolveDescriptionDir(
+  env: Record<string, string | undefined>,
+  platform: string,
+  home: string,
+): string {
+  return path.join(userCacheRootBase(env, platform, home), "descriptions")
+}
+
+/**
+ * 描述缓存的容量上限（模块级可变对象，便于测试注入小值；与 providersTimeout 同风格）。
+ * - maxEntries：最大条目数（2000）
+ * - maxBytes：条目文件字节总和上限（50 MB）
+ * 容量超限触发 LRU 淘汰（按文件 mtime 升序删最旧）。**单条即超 maxBytes 的条目不入缓存**
+ * （A / 硬上限，写前 utf8 字节预检跳过），保证磁盘恒 ≤ maxBytes、不因巨值挤掉已付费条目。
+ */
+export const descriptionCacheLimits = {
+  maxEntries: 2000,
+  maxBytes: 50 * 1024 * 1024,
 }
 
 /**
@@ -188,12 +228,6 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   const sessionModels = new Map<string, { providerID: string; modelID: string }>()
   /** "provider/model" → 是否具备图片输入能力（查询结果缓存，进程级） */
   const imageCapable = new Map<string, boolean>()
-  /**
-   * 描述缓存："<sha>:<question>" → 描述结果（同一张图 + 同一个问题只描述一次）。
-   * 值带 modelId：记录实际产出该描述的候选模型，缓存命中时标签沿用入库模型，
-   * 而不是用当前候选链链首近似（链配置变化或 fallback 命中次选时标签才真实）。
-   */
-  const descriptions = new Map<string, { modelId: string; text: string }>()
   /** 本插件创建的子会话 ID 集合（正常路径用后即删，dispose 兜底清理残留） */
   const subSessions = new Set<string>()
 
@@ -451,6 +485,91 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     }
   }
 
+  // ---- 描述缓存（用户级目录落盘，磁盘即事实；全链 fail-open） ---------------------
+  /** 描述缓存 key → 磁盘文件路径（<dir>/<sha256(key)>.json）。 */
+  const descCacheFile = (key: string): string =>
+    path.join(resolveDescriptionDir(process.env, process.platform, homedir()), `${createHash("sha256").update(key).digest("hex")}.json`)
+
+  /** 读取描述缓存：命中（JSON shape 合法）touch mtime 后返回，任何失败一律 miss。 */
+  const descCacheGet = async (key: string): Promise<{ modelId: string; text: string } | undefined> => {
+    try {
+      const file = descCacheFile(key)
+      const raw = JSON.parse(await fs.readFile(file, "utf8")) as unknown
+      if (
+        typeof raw !== "object" ||
+        raw === null ||
+        typeof (raw as { modelId?: unknown }).modelId !== "string" ||
+        typeof (raw as { text?: unknown }).text !== "string"
+      ) {
+        return undefined
+      }
+      const value = raw as { modelId: string; text: string }
+      // 命中即触摸 mtime → 作为 LRU 时钟（best-effort）
+      const now = new Date()
+      await fs.utimes(file, now, now).catch(() => {})
+      return value
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 写描述缓存（tmp+rename 原子）并触发容量淘汰；任何失败静默吞掉（best-effort）。
+   * 超限策略（A / 硬上限）：序列化后先按 utf8 字节预检，单条 > maxBytes 则**不入缓存**
+   * （不写盘、不触发淘汰、不删除该 key 已有的旧条目）——避免"超限巨值挤掉全部已付费条目、
+   * 且自身活不过下一次无关写入"的写→删抖动，保证磁盘恒 ≤ maxBytes。
+   */
+  const descCacheSet = async (key: string, value: { modelId: string; text: string }): Promise<void> => {
+    const payload = JSON.stringify(value)
+    // 口径与 evict 的 fs.stat().size 一致：磁盘 utf8 字节，非字符串 length（中文/emoji 不等价）
+    if (Buffer.byteLength(payload, "utf8") > descriptionCacheLimits.maxBytes) return
+    const file = descCacheFile(key)
+    const dir = path.dirname(file)
+    const tmp = path.join(dir, `${path.basename(file)}.tmp-${randomUUID()}`)
+    try {
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+      await fs.writeFile(tmp, payload)
+      await fs.rename(tmp, file)
+    } catch {
+      await fs.unlink(tmp).catch(() => {})
+      return
+    }
+    await evictDescriptionCache(dir, path.basename(file))
+  }
+
+  /** LRU + 容量淘汰：超出 maxEntries / maxBytes 时按 mtime 升序删最旧，直到双条件满足。 */
+  const evictDescriptionCache = async (dir: string, protectName?: string): Promise<void> => {
+    try {
+      const names = (await fs.readdir(dir)).filter((n) => n.endsWith(".json"))
+      const stats = await Promise.all(
+        names.map(async (name) => {
+          try {
+            const s = await fs.stat(path.join(dir, name))
+            return { name, size: s.size, mtimeMs: s.mtimeMs }
+          } catch {
+            return undefined
+          }
+        }),
+      )
+      const entries = stats.filter((s): s is NonNullable<typeof s> => s !== undefined)
+      const { maxEntries, maxBytes } = descriptionCacheLimits
+      let total = entries.reduce((sum, e) => sum + e.size, 0)
+      entries.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+      // 逐条删最旧直至双条件满足；刚写入的条目受保护（极端单条超限时保留最新，不自我删除）。
+      // 用额外计数控制，不就地改遍历数组（entries 仅作删除候选快照）。
+      let remaining = entries.length
+      for (const entry of entries) {
+        if (total <= maxBytes && remaining <= maxEntries) break
+        if (entry.name === protectName) continue
+        await fs.unlink(path.join(dir, entry.name)).catch(() => {})
+        total -= entry.size
+        remaining -= 1
+      }
+    } catch {
+      // 目录扫描/删除失败忽略：淘汰是 best-effort，下次写入再触发
+    }
+  }
+
   /**
    * vision_analyze 工具：主模型传入图片路径与问题，返回视觉模型给出的描述。
    * 工具永不抛错——所有失败都以错误文字返回，让 agent 循环可以读到原因并
@@ -495,8 +614,9 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       }
 
       // 描述缓存：内容哈希 + 问题作为 key，命中直接复用（title 标注 cached）。
+      // 落盘在用户级共享目录（resolveDescriptionDir）——跨项目/进程/重启命中；磁盘即事实。
       const key = `${createHash("sha256").update(image.bytes).digest("hex")}:${question}`
-      const cached = descriptions.get(key)
+      const cached = await descCacheGet(key)
       if (cached !== undefined) {
         // 命中时标签沿用入库时的模型（cached.modelId）：即便此刻候选链链首
         // 已与入库模型不同，也保持标签真实、不重写。
@@ -506,7 +626,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       const result = await describeWithChain(image, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
       // 入库带上实际产出描述的候选 modelId，供后续缓存命中还原真实标签
-      descriptions.set(key, { modelId: result.modelId, text: result.text })
+      await descCacheSet(key, { modelId: result.modelId, text: result.text })
       // 成功标签直接用实际产出描述的候选引用键（而非链首近似）
       return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
     } catch (error) {
