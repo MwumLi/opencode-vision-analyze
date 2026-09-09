@@ -2,8 +2,8 @@
  * opencode-vision-analyze
  *
  * 为「不具备视觉能力的主模型」提供图片解读路由：当用户在消息中附带图片时，
- * 插件把图片落盘到 vision 目录（git 项目内 → <项目>/.opencode/vision；
- * 非 git 目录 → 用户级缓存目录），并向模型注入一条 synthetic 提示
+ * 插件把图片落盘到**用户级共享目录**（<cache>/opencode-vision-analyze/vision，
+ * 恒用户级、与 git/非 git 无关），并向模型注入一条 synthetic 提示
  * （TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具让指定的视觉
  * 模型描述图片。若主模型本身支持图片输入，则不做任何干预，原图直接发给主模型。
  *
@@ -14,8 +14,10 @@
  * 键缓存到**用户级共享目录**（<cache>/opencode-vision-analyze/descriptions，
  * 每条目一文件、mtime 作 LRU 时钟、2000 条 / 50MB 双上限、单条超限不入缓存）——
  * 跨项目/跨进程/插件重启后同图同问题只描述一次。
- * image_path 除了绝对路径也接受 http(s) URL：先下载落盘到同一 vision
- * 目录（内容哈希命名，天然与附件落盘去重），再走统一的磁盘加载路径。
+ * image_path 除了绝对路径也接受 http(s) URL：先下载落盘到同一用户级 vision
+ * 目录（内容哈希命名，天然与附件落盘去重；LRU + 容量上限，2000 条 / 500MB），
+ * 再走统一的磁盘加载路径。**本地已存在的文件直接原位读取**（不复制、不 touch），
+ * 只有贴图/下载才写缓存。
  * 主模型本身支持图片输入时走快速路径：不做子会话描述，直接把原图作为
  * 工具附件回传给模型自行查看。
  *
@@ -27,7 +29,6 @@
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
  */
 import { createHash, randomUUID } from "node:crypto"
-import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -86,21 +87,6 @@ const VISION_SYSTEM_PROMPT = [
 const DATA_URL_PATTERN = /^data:([^;]+);base64,(.+)$/
 
 /**
- * 判断目录是否位于 git 项目内：从 dir 向上（含自身）逐级找 `.git`
- * （目录，或 worktree/submodule 的 `.git` 指针文件），到文件系统根为止。
- * 纯同步、纯内置模块；作为命名导出便于单元测试注入真实临时目录验证。
- */
-export function isInsideGitRepo(dir: string): boolean {
-  let cur = path.resolve(dir)
-  for (;;) {
-    if (existsSync(path.join(cur, ".git"))) return true
-    const parent = path.dirname(cur)
-    if (parent === cur) return false // 已到文件系统根
-    cur = parent
-  }
-}
-
-/**
  * 用户级 cache 的平台根（不带应用子目录）：cache 目录 + opencode-vision-analyze。
  * 空字符串 env 视为未设置（XDG/LOCALAPPDATA 官规：空值=未设置）——避免把 "" 当
  * 有效根导致 path.join("",…) 产出相对路径、相对进程 cwd 落盘。
@@ -121,7 +107,8 @@ export function userCacheRootBase(
 }
 
 /**
- * 用户级（非 git）图片缓存的平台根：cache 目录 + opencode-vision-analyze/vision。
+ * 图片缓存的平台根（恒用户级、与 git 无关）：cache 目录 + opencode-vision-analyze/vision。
+ * 贴图与 http(s) 下载统一落盘于此（内容寻址命名）；本地已存在文件不复制、原位读用。
  */
 export function userVisionCacheRoot(
   env: Record<string, string | undefined>,
@@ -129,21 +116,6 @@ export function userVisionCacheRoot(
   home: string,
 ): string {
   return path.join(userCacheRootBase(env, platform, home), "vision")
-}
-
-/**
- * 图片存储根：与 opencode 的项目/全局语义对齐——
- * git 项目内 → <项目>/.opencode/vision（现状）；非 git 目录 → 用户级缓存目录。
- * 解析一次即可（纯函数，入参可注入以便三平台与 env 覆盖的单测）。
- */
-export function resolveVisionDir(
-  inputDir: string,
-  env: Record<string, string | undefined>,
-  platform: string,
-  home: string,
-): string {
-  if (isInsideGitRepo(inputDir)) return path.join(path.resolve(inputDir), ".opencode", "vision")
-  return userVisionCacheRoot(env, platform, home)
 }
 
 /**
@@ -170,6 +142,19 @@ export function resolveDescriptionDir(
 export const descriptionCacheLimits = {
   maxEntries: 2000,
   maxBytes: 50 * 1024 * 1024,
+}
+
+/**
+ * 图片缓存的容量上限（模块级可变对象，便于测试注入小值；与 providersTimeout 同风格）。
+ * - maxEntries：最大条目数（2000）
+ * - maxBytes：条目文件字节总和上限（500 MB）
+ * 容量超限触发 LRU 淘汰（按文件 mtime 升序删最旧）。与描述缓存不同，图片**允许单图超限**
+ * （贴图/下载必须给模型稳定 image_path，不能拒绝落盘）：单图 > maxBytes 仍写入且当次受
+ * protect 保护，容量可短暂超限，待下一次无关写入淘汰时收敛（best-effort）。
+ */
+export const visionCacheLimits = {
+  maxEntries: 2000,
+  maxBytes: 500 * 1024 * 1024,
 }
 
 /**
@@ -394,14 +379,14 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     `[Image: ${basename} — described by ${modelId}]\n${text}`
 
   /**
-   * 把图片字节内容原子落盘并返回最终 filepath。每次调用现算存储根
-   * （git 项目 → 项目 .opencode/vision；非 git → 用户级缓存，见 resolveVisionDir）：
-   * 运行中存储范围变化（如 git init）从下一条图片起即时生效，无需重启。
-   * 先写 `<sha><ext>.tmp-<uuid>` 再 rename：共享目录（用户级/多实例）并发写同一 sha
-   * 时内容寻址下原子幂等；失败先清理临时文件再抛错，避免孤儿 tmp 累积。
+   * 把图片字节内容原子落盘到**用户级缓存目录**（<cache>/opencode-vision-analyze/vision，
+   * 与 git 无关）并返回最终 filepath。贴图与 http(s) 下载统一经此写入（本地已存在文件
+   * 不复制、直接原位读用）。先写 `<sha><ext>.tmp-<uuid>` 再 rename：共享目录多进程并发
+   * 写同一 sha 时内容寻址下原子幂等；失败先清理临时文件再抛错，避免孤儿 tmp 累积。
+   * rename 成功后触发图片 LRU 容量淘汰（刚写入文件受 protect 保护）。
    */
   const persistImageBytes = async (bytes: Buffer, ext: string): Promise<string> => {
-    const dir = resolveVisionDir(input.directory, process.env, process.platform, homedir())
+    const dir = userVisionCacheRoot(process.env, process.platform, homedir())
     const sha = createHash("sha256").update(bytes).digest("hex")
     const filepath = path.join(dir, `${sha}${ext}`)
     const tmpPath = path.join(dir, `${sha}${ext}.tmp-${randomUUID()}`)
@@ -413,6 +398,10 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       await fs.unlink(tmpPath).catch(() => {})
       throw error
     }
+    await evictToCaps(dir, visionCacheLimits, {
+      filter: (name) => /^[0-9a-f]{64}\.(png|jpe?g|gif|webp)$/i.test(name),
+      protectName: path.basename(filepath),
+    })
     return filepath
   }
 
@@ -472,6 +461,8 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
 
   /**
    * 从磁盘加载图片：按扩展名识别 MIME，读取失败或文件为空返回 undefined。
+   * LRU 时钟：**仅当图片位于本插件 vision 缓存根内**（贴图/下载落盘产物）才 touch mtime；
+   * 流程 B 直读的外部本地文件绝不触碰（不得改写用户文件 mtime）。
    */
   const loadImage = async (filepath: string): Promise<{ bytes: Buffer; mime: string } | undefined> => {
     const mime = EXT_MIME[path.extname(filepath).toLowerCase()]
@@ -479,6 +470,13 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     try {
       const bytes = await fs.readFile(filepath)
       if (bytes.length === 0) return undefined
+      const visionRoot = userVisionCacheRoot(process.env, process.platform, homedir())
+      const rel = path.relative(visionRoot, filepath)
+      if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+        // 命中缓存内文件 → touch mtime 作 LRU 时钟（best-effort，失败不影响读）
+        const now = new Date()
+        await fs.utimes(filepath, now, now).catch(() => {})
+      }
       return { bytes, mime }
     } catch {
       return undefined
@@ -534,13 +532,24 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       await fs.unlink(tmp).catch(() => {})
       return
     }
-    await evictDescriptionCache(dir, path.basename(file))
+    await evictToCaps(dir, descriptionCacheLimits, {
+      filter: (name) => name.endsWith(".json"),
+      protectName: path.basename(file),
+    })
   }
 
-  /** LRU + 容量淘汰：超出 maxEntries / maxBytes 时按 mtime 升序删最旧，直到双条件满足。 */
-  const evictDescriptionCache = async (dir: string, protectName?: string): Promise<void> => {
+  /**
+   * 通用 LRU + 容量淘汰（描述/图片缓存复用）：超出 limits.maxEntries / maxBytes 时按
+   * mtime 升序删最旧，直到双条件满足。filter 限定参与淘汰的文件（描述 .json；图片 sha 文件，
+   * 排除 tmp 残留）；protectName 保护刚写入的条目不被本次淘汰自删。
+   */
+  const evictToCaps = async (
+    dir: string,
+    limits: { maxEntries: number; maxBytes: number },
+    opts: { filter: (name: string) => boolean; protectName?: string },
+  ): Promise<void> => {
     try {
-      const names = (await fs.readdir(dir)).filter((n) => n.endsWith(".json"))
+      const names = (await fs.readdir(dir)).filter(opts.filter)
       const stats = await Promise.all(
         names.map(async (name) => {
           try {
@@ -552,7 +561,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         }),
       )
       const entries = stats.filter((s): s is NonNullable<typeof s> => s !== undefined)
-      const { maxEntries, maxBytes } = descriptionCacheLimits
+      const { maxEntries, maxBytes } = limits
       let total = entries.reduce((sum, e) => sum + e.size, 0)
       entries.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
       // 逐条删最旧直至双条件满足；刚写入的条目受保护（极端单条超限时保留最新，不自我删除）。
@@ -560,7 +569,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       let remaining = entries.length
       for (const entry of entries) {
         if (total <= maxBytes && remaining <= maxEntries) break
-        if (entry.name === protectName) continue
+        if (entry.name === opts.protectName) continue
         await fs.unlink(path.join(dir, entry.name)).catch(() => {})
         total -= entry.size
         remaining -= 1
@@ -582,7 +591,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     const title = "vision_analyze"
     try {
       const question = args.question?.trim() || "Describe this image in full detail."
-      // http(s) URL：先下载到本地 vision 目录，再统一走磁盘加载路径。
+      // http(s) URL：先下载到用户级 vision 缓存目录，再统一走磁盘加载路径。
       // ctx.abort 传入下载：用户中止即刻断下载（含 pre-abort 不再发请求）。
       const download = /^https?:\/\//i.test(args.image_path)
         ? await downloadImage(args.image_path, ctx.abort)
