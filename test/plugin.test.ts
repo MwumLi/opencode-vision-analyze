@@ -32,7 +32,17 @@ import {
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
-import { providersTimeout, resolveDescriptionDir, descriptionCacheLimits, visionCacheLimits, userVisionCacheRoot } from "../src/index"
+import {
+  providersTimeout,
+  resolveDescriptionDir,
+  descriptionCacheLimits,
+  visionCacheLimits,
+  userVisionCacheRoot,
+  GENERIC_QUESTION,
+  genericWriteMinText,
+  isGenericQuestion,
+  normalizeQuestion,
+} from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
 let dir: string
@@ -66,7 +76,7 @@ async function fileExists(filepath: string): Promise<boolean> {
 function getAnalyze(hooks: LoadedPlugin["hooks"]) {
   const tool = (hooks.tool as Record<string, { execute: unknown }>)["vision_analyze"]
   if (!tool || typeof tool.execute !== "function") throw new Error("vision_analyze tool not registered")
-  return tool.execute as (args: { image_path: string; question: string }, ctx: ToolContext) => Promise<ToolResult>
+  return tool.execute as (args: { image_path: string; question?: string }, ctx: ToolContext) => Promise<ToolResult>
 }
 
 /** 标准工具上下文（独立 AbortController，可由测试手动 abort）。 */
@@ -179,6 +189,8 @@ describe("chat.message 钩子", () => {
     expect(hint.synthetic).toBe(true)
     expect(hint.text).toContain("vision_analyze")
     expect(hint.text).toContain(`image_path: ${persistedPath()}`)
+    // 契约：提示词必须教主模型“泛解析省略 question”，避免它每次自编措辞导致缓存 key 分片
+    expect(hint.text).toContain("WITHOUT a question")
 
     // 图片按内容哈希落盘
     expect(await fileExists(persistedPath())).toBe(true)
@@ -250,6 +262,10 @@ describe("vision_analyze 工具", () => {
     expect(tool.description.length).toBeGreaterThan(0)
     expect(tool.args["image_path"]).toBeDefined()
     expect(tool.args["question"]).toBeDefined()
+    // 契约：question 语义为可选，且不能再用旧文案鼓励“具体一点”（那会诱导措辞分化，破坏泛解析收敛）
+    expect(tool.description).toContain("question is optional")
+    expect(tool.description).not.toContain("be specific")
+    expect(String(tool.args["question"]["description"])).toContain("Optional")
   })
 
   test("描述路径：创建子会话调用视觉模型并返回描述，子会话用后即删", async () => {
@@ -1571,6 +1587,147 @@ describe("描述缓存落盘持久化（用户级目录 + LRU/容量）", () => 
     expect(client.calls.prompt.length).toBe(1)
     const files = await readdir(descDir())
     expect(files.filter((f) => f.includes(".tmp-"))).toHaveLength(0)
+  })
+
+  // ---- 泛解析 canonical key：省略/空/措辞变体收敛到同一条，跨会话命中 ----
+
+  /** 一段足够长的描述（超过泛解析写入门槛 100 字符），供需要落盘的用例注入。 */
+  const LONG_TEXT = "complete description of the dashboard with a red square in the center and a blue circle on the right. ".repeat(3)
+
+  test("isGenericQuestion：空串与 canonical 变体判泛解析，具体追问不判", () => {
+    // 泛解析：空 / 纯空白 / 原文 / 大小写+引号 / 全角引号 / 缺句末标点
+    expect(isGenericQuestion("")).toBe(true)
+    expect(isGenericQuestion("   ")).toBe(true)
+    expect(isGenericQuestion(GENERIC_QUESTION)).toBe(true)
+    expect(isGenericQuestion('  "Describe This Image In Full Detail."  ')).toBe(true)
+    expect(isGenericQuestion("「describe this image in full detail」")).toBe(true)
+    expect(isGenericQuestion("Describe this image in full detail")).toBe(true)
+    expect(isGenericQuestion("describe this image in full detail?")).toBe(true)
+    // 具体追问：既有用例用词、针对性问句、带 canonical 句子的追问都不能误判为泛解析
+    expect(isGenericQuestion("persist me")).toBe(false)
+    expect(isGenericQuestion("who labels")).toBe(false)
+    expect(isGenericQuestion("what color is the logo?")).toBe(false)
+    expect(isGenericQuestion("Describe this image in full detail, and read the error inside the red box.")).toBe(false)
+  })
+
+  test("normalizeQuestion：去首尾引号括号、折叠空白、统一大小写、去句末标点", () => {
+    expect(normalizeQuestion("  Describe  This   Image in full detail. ")).toBe("describe this image in full detail")
+    expect(normalizeQuestion("「解析图片」")).toBe("解析图片")
+    expect(normalizeQuestion("describe this image\nin full detail!")).toBe("describe this image in full detail")
+  })
+
+  test("泛解析省略 question：落 GENERIC_QUESTION 单条；显式 canonical 与措辞变体跨实例命中", async () => {
+    await seedImage()
+    const clientA = makeStubClient()
+    clientA.setPromptBehavior(async () => ({ data: { parts: [{ type: "text", text: LONG_TEXT }] } }))
+    const { hooks: hooksA } = await loadPlugin(makePluginInput(dir, clientA), { models: ["test/vision-model"] })
+    const analyzeA = getAnalyze(hooksA)
+
+    // 实例A：主模型对“解析图片”不填 question（省略）→ 走默认 canonical，落一条固定 key
+    const first = await analyzeA({ image_path: persistedPath() }, toolCtx(new AbortController().signal))
+    expect(first.title).toBe("vision_analyze")
+    expect(clientA.calls.prompt.length).toBe(1)
+    // 发给视觉子会话的问题就是 canonical 原文（不是空串/自编措辞）
+    const parts = clientA.calls.prompt[0]?.parts as Array<Record<string, unknown>>
+    expect(parts.some((p) => p["type"] === "text" && p["text"] === GENERIC_QUESTION)).toBe(true)
+    expect(await fileExists(descPath(GENERIC_QUESTION))).toBe(true)
+
+    // 实例B：显式传 canonical → 命中
+    const clientB = makeStubClient()
+    const { hooks: hooksB } = await loadPlugin(makePluginInput(dir, clientB), { models: ["test/vision-model"] })
+    const second = await getAnalyze(hooksB)(
+      { image_path: persistedPath(), question: GENERIC_QUESTION },
+      toolCtx(new AbortController().signal),
+    )
+    expect(second.title).toBe("vision_analyze (cached)")
+    expect(clientB.calls.prompt.length).toBe(0)
+
+    // 实例C：措辞变体（大小写/引号/多余空白）→ 归一化后同样命中
+    const clientC = makeStubClient()
+    const { hooks: hooksC } = await loadPlugin(makePluginInput(dir, clientC), { models: ["test/vision-model"] })
+    const third = await getAnalyze(hooksC)(
+      { image_path: persistedPath(), question: '  "DESCRIBE THIS IMAGE IN FULL DETAIL"  ' },
+      toolCtx(new AbortController().signal),
+    )
+    expect(third.title).toBe("vision_analyze (cached)")
+    expect(clientC.calls.prompt.length).toBe(0)
+  })
+
+  test("存量旧默认条目兼容：磁盘已有 sha:GENERIC_QUESTION（旧版空 question 产物），省略 question 直接命中", async () => {
+    await seedImage()
+    // 手工铺一个与旧版本（空 question → 默认串入 key）等价的条目
+    await mkdir(descDir(), { recursive: true })
+    await writeFile(
+      descPath(GENERIC_QUESTION),
+      JSON.stringify({ modelId: "test/other-vision", text: "legacy full description of the dashboard" }),
+    )
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const hit = await getAnalyze(hooks)({ image_path: persistedPath() }, toolCtx(new AbortController().signal))
+    expect(hit.title).toBe("vision_analyze (cached)")
+    expect(hit.output).toContain("legacy full description")
+    expect(client.calls.prompt.length).toBe(0)
+  })
+
+  test("泛解析与具体追问并存：各写各的 key，重复具体追问与重复泛解析均各自命中", async () => {
+    await seedImage()
+    const client = makeStubClient()
+    client.setPromptBehavior(async () => ({ data: { parts: [{ type: "text", text: LONG_TEXT }] } }))
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+
+    // 先泛解析（省略）→ 写 canonical 条目
+    const generic = await analyze({ image_path: persistedPath() }, toolCtx(new AbortController().signal))
+    expect(generic.title).toBe("vision_analyze")
+    expect(await fileExists(descPath(GENERIC_QUESTION))).toBe(true)
+
+    // 具体追问 → 写自己的精确条目（key 与旧格式 sha:question 一致）
+    const targetedQ = "what color is the logo in the top-left corner?"
+    const targeted = await analyze(
+      { image_path: persistedPath(), question: targetedQ },
+      toolCtx(new AbortController().signal),
+    )
+    expect(targeted.title).toBe("vision_analyze")
+    expect(await fileExists(descPath(targetedQ))).toBe(true)
+
+    // 各自重复 → 各自命中，互不串用
+    const again = await analyze(
+      { image_path: persistedPath(), question: targetedQ },
+      toolCtx(new AbortController().signal),
+    )
+    expect(again.title).toBe("vision_analyze (cached)")
+    const genericAgain = await analyze({ image_path: persistedPath() }, toolCtx(new AbortController().signal))
+    expect(genericAgain.title).toBe("vision_analyze (cached)")
+    const files = (await readdir(descDir())).filter((f) => f.endsWith(".json"))
+    expect(files.length).toBe(2)
+  })
+
+  test("泛解析短文本不落盘（防毒化），具体追问短答案不受限", async () => {
+    await seedImage()
+    const saved = genericWriteMinText.chars
+    genericWriteMinText.chars = 100
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+    try {
+      // 泛解析 + 视觉模型敷衍返回极短文本 → 文本照常返回但不落盘
+      client.setPromptBehavior(async () => ({ data: { parts: [{ type: "text", text: "ok" }] } }))
+      const g = await analyze({ image_path: persistedPath() }, toolCtx(new AbortController().signal))
+      expect(g.title).toBe("vision_analyze")
+      expect(g.output).toContain("ok")
+      expect(await fileExists(descPath(GENERIC_QUESTION))).toBe(false)
+
+      // 具体追问 + 同样短文本（短答案合法）→ 允许落盘
+      client.setPromptBehavior(async () => ({ data: { parts: [{ type: "text", text: "42" }] } }))
+      const t = await analyze(
+        { image_path: persistedPath(), question: "how many red squares" },
+        toolCtx(new AbortController().signal),
+      )
+      expect(t.title).toBe("vision_analyze")
+      expect(await fileExists(descPath("how many red squares"))).toBe(true)
+    } finally {
+      genericWriteMinText.chars = saved
+    }
   })
 })
 
