@@ -4,6 +4,7 @@
 > 分支：`feat/description-cache-generic-key`（基于 main @ 0.4.0）
 > 门禁：`bun run typecheck && bun test && bun run build`。TDD：先写会失败的测试，再改源码。
 > 交付后不自行 push / merge / 发版。
+> 迭代内修订（review 反馈）：canonical 文案扩为点名文字/UI/图表/可见内容的完整句；question schema 增 `default: GENERIC_QUESTION`；chat.message hint 维持"省略 question"口径不动。
 
 ## 任务拆解
 
@@ -15,7 +16,7 @@
 3. 源码（绿）：`src/index.ts`
    - 导出 `GENERIC_QUESTION`、`genericWriteMinText = { chars: 100 }`、`normalizeQuestion`、`isGenericQuestion`。
    - `visionAnalyze` 内：默认串改引 `GENERIC_QUESTION`；按 isGeneric 改写 question；写盘处加 generic 最短长度门槛。
-   - 工具 description / args.question 文案改 Optional；chat.message hint 追加「泛解析省略 question」。
+   - 工具 description / args.question 文案改可选，args.question 增加 `default: GENERIC_QUESTION` 且 description 写明默认串；chat.message hint 追加「泛解析省略 question」。
    - 运行 `bun test` 全绿。
 4. 文档：README.md / README.zh.md 缓存段与已知限制；`src/index.ts` 头注释。
 5. 门禁：`bun run typecheck && bun test && bun run build`。
@@ -28,7 +29,7 @@
   - `isGenericQuestion("")`、GENERIC_QUESTION 原文 → true
   - 变体：带首尾引号、全大写、全角空格、缺末尾句点 → true
   - `"persist me"`、`"q1"`、`"small"`、`"who labels"` → false
-  - 带 canonical 句子的针对性追问（例：`"Describe this image in full detail, and read the error in the red box."`）→ false
+  - 带 canonical 句子的针对性追问（例：`"Describe this image in full detail, including all text, UI elements, diagrams, or content visible, and read the error inside the red box."`）→ false
 - e2e（复用 descPath 助手）：
   - 实例A 省略 question → `vision_analyze`、prompt 1、落盘 `descPath(GENERIC_QUESTION)`
   - 独立实例B 显式 `GENERIC_QUESTION` → `(cached)`、prompt 0

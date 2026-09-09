@@ -15,7 +15,7 @@
 - **工具化，而非提交时预分析。** 轮次即时启动；模型自己决定何时看图、带着什么问题看。提交零阻塞，失败在 agent 循环里可见、可重试。
 - **描述针对问题。** 模型把自己关注的问题传给 `vision_analyze`——而不是提交时预生成的一次性通用描述。若只是让描述整张图，模型留空 `question`，工具用固定文案兜底，使同一张图的泛描述共享一条缓存（见"内容寻址缓存"）。
 - **原生快速路径。** 主模型本身有视觉能力时，`vision_analyze` 完全跳过视觉模型，直接把原图作为工具附件返回。
-- **内容寻址缓存。** 图片按内容寻址 `<sha256>.<ext>` 落盘到**用户级共享目录**（`<cache>/opencode-vision-analyze/vision`，跨项目/会话天然去重，LRU 上限 2000 条 / 500MB）；描述按 `<图片哈希>:<生效问题>` 缓存到**用户级共享目录**（`<cache>/opencode-vision-analyze/descriptions`）——跨项目/进程/插件重启同图同问题只描述一次；描述缓存 LRU 上限 2000 条 / 50MB。泛解析（空 / 省略 question）会归一化到固定文案，全部落在 `<图片sha>:Describe this image in full detail.` 同一条 key 上——同一个"解析这张图"的请求，只要主模型省略 question 或措辞与固定文案等价，跨会话就能命中同一条缓存，而不是把缓存拆成多份。
+- **内容寻址缓存。** 图片按内容寻址 `<sha256>.<ext>` 落盘到**用户级共享目录**（`<cache>/opencode-vision-analyze/vision`，跨项目/会话天然去重，LRU 上限 2000 条 / 500MB）；描述按 `<图片哈希>:<生效问题>` 缓存到**用户级共享目录**（`<cache>/opencode-vision-analyze/descriptions`）——跨项目/进程/插件重启同图同问题只描述一次；描述缓存 LRU 上限 2000 条 / 50MB。泛解析（空 / 省略 question）会归一化到固定文案，全部落在 `<图片sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.` 同一条 key 上——同一个"解析这张图"的请求，只要主模型省略 question 或措辞与固定文案等价，跨会话就能命中同一条缓存，而不是把缓存拆成多份。
 - **统一鉴权。** 视觉调用走 opencode 子会话，复用 opencode 已管理的 provider 凭据，无需额外配置 API Key。
 
 ## 安装
@@ -71,7 +71,7 @@ curl 方式说明：
 
 图片存储：**恒定放用户级共享目录** `<cache>/opencode-vision-analyze/vision`（与 git / 非 git 分域无关），同一用户所有项目共享；每个唯一图片一个内容寻址 `<sha256>.<ext>` 文件。贴图与 http(s) 下载写入于此（临时文件 + rename 原子写，多个 opencode 进程可安全共享）；**模型直接把本地已存在文件路径传给工具时不复制、原位读用**。各平台默认：Linux `$XDG_CACHE_HOME || ~/.cache`；macOS `~/Library/Caches`（亦接受 `$XDG_CACHE_HOME` 覆盖）；Windows `%LOCALAPPDATA% || ~/AppData/Local`。缓存根 env 为空串视为未设置（回退默认）。图片缓存 LRU 上限 2000 条 / 500MB，任一超限即按文件 mtime 淘汰最久未用的条目——无需任何 `.gitignore` 条目。
 
-描述缓存：**恒定放用户级共享目录** `<cache>/opencode-vision-analyze/descriptions`（与 git / 非 git 分域无关）——每条目一个 JSON 文件，key 为 `<图片sha256>:<生效问题>`、文件名取 `sha256(key)`。`question` 参数可选：描述整张图的泛解析（空 / 省略）会归一化到固定文案 `Describe this image in full detail.`，措辞与固定文案归一化等价时即落在 key `<图片sha>:Describe this image in full detail.`；具体追问保留原问句走各自的 `<图片sha>:<问题>` key（格式与旧版一致，存量条目照常命中）。泛解析条目要求描述文本 ≥ 100 字符才写入，防止视觉模型敷衍/拒答的短文本毒化整图共享条目。容量上限 2000 条 / 50MB，任一超限即按文件 mtime 淘汰最久未用的条目（LRU）。写入为原子操作（临时文件 + rename），多个 opencode 进程可安全共享同一描述缓存。
+描述缓存：**恒定放用户级共享目录** `<cache>/opencode-vision-analyze/descriptions`（与 git / 非 git 分域无关）——每条目一个 JSON 文件，key 为 `<图片sha256>:<生效问题>`、文件名取 `sha256(key)`。`question` 参数可选：描述整张图的泛解析（空 / 省略）会归一化到固定文案 `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`，措辞与固定文案归一化等价时即落在 key `<图片sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`；具体追问保留原问句走各自的 `<图片sha>:<问题>` key（格式与旧版一致，存量条目照常命中）。泛解析条目要求描述文本 ≥ 100 字符才写入，防止视觉模型敷衍/拒答的短文本毒化整图共享条目。容量上限 2000 条 / 50MB，任一超限即按文件 mtime 淘汰最久未用的条目（LRU）。写入为原子操作（临时文件 + rename），多个 opencode 进程可安全共享同一描述缓存。
 
 有序候选 + 自动续接 + 免费优先的配置示例：
 

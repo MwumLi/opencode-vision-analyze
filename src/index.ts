@@ -166,12 +166,14 @@ export const visionCacheLimits = {
  *
  * 主模型对「解析这张图 / 描述图片」这类请求应省略 question，由工具用这里的文案兜底，
  * 从而让所有泛解析请求的缓存 key 收敛到同一条（key = <图片sha>:GENERIC_QUESTION），
- * 避免主模型每次自编措辞把缓存拆成多份、跨会话永远命中不了。
+ * 避免主模型每次自编措辞把缓存拆成多份、跨会话永远命中不了。文案点名文字/UI/图表/
+ * 可见内容，驱动视觉模型把整图信息尽量带全。
  *
  * 这份文案相当于公开契约：改动它会让旧的泛解析缓存条目失去命中（由 LRU 按 mtime 清理），
  * 属于刻意为之——将来想改泛描述措辞、或按用户/场景定制时，改文案即可自然分开新旧缓存。
  */
-export const GENERIC_QUESTION = "Describe this image in full detail."
+export const GENERIC_QUESTION =
+  "Describe this image in full detail, including all text, UI elements, diagrams, or content visible."
 
 /**
  * 泛解析缓存条目的最短文本长度（字符）。

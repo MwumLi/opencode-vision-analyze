@@ -1603,22 +1603,52 @@ describe("描述缓存落盘持久化（用户级目录 + LRU/容量）", () => 
     expect(isGenericQuestion("")).toBe(true)
     expect(isGenericQuestion("   ")).toBe(true)
     expect(isGenericQuestion(GENERIC_QUESTION)).toBe(true)
-    expect(isGenericQuestion('  "Describe This Image In Full Detail."  ')).toBe(true)
-    expect(isGenericQuestion("「describe this image in full detail」")).toBe(true)
-    expect(isGenericQuestion("Describe this image in full detail")).toBe(true)
-    expect(isGenericQuestion("describe this image in full detail?")).toBe(true)
-    expect(isGenericQuestion("describe\u3000this\u3000image\u3000in\u3000full\u3000detail")).toBe(true)
+    expect(
+      isGenericQuestion(
+        '  "Describe This Image In Full Detail, Including All Text, UI Elements, Diagrams, Or Content Visible."  ',
+      ),
+    ).toBe(true)
+    expect(
+      isGenericQuestion(
+        "「describe this image in full detail, including all text, ui elements, diagrams, or content visible」",
+      ),
+    ).toBe(true)
+    expect(
+      isGenericQuestion(
+        "Describe this image in full detail, including all text, UI elements, diagrams, or content visible",
+      ),
+    ).toBe(true)
+    expect(
+      isGenericQuestion(
+        "describe this image in full detail, including all text, ui elements, diagrams, or content visible?",
+      ),
+    ).toBe(true)
+    expect(
+      isGenericQuestion(
+        "describe\u3000this\u3000image\u3000in\u3000full\u3000detail,\u3000including\u3000all\u3000text,\u3000ui\u3000elements,\u3000diagrams,\u3000or\u3000content\u3000visible",
+      ),
+    ).toBe(true)
     // 具体追问：既有用例用词、针对性问句、带 canonical 句子的追问都不能误判为泛解析
     expect(isGenericQuestion("persist me")).toBe(false)
     expect(isGenericQuestion("who labels")).toBe(false)
     expect(isGenericQuestion("what color is the logo?")).toBe(false)
-    expect(isGenericQuestion("Describe this image in full detail, and read the error inside the red box.")).toBe(false)
+    expect(
+      isGenericQuestion(
+        "Describe this image in full detail, including all text, UI elements, diagrams, or content visible, and read the error inside the red box.",
+      ),
+    ).toBe(false)
   })
 
   test("normalizeQuestion：去首尾引号括号、折叠空白、统一大小写、去句末标点", () => {
-    expect(normalizeQuestion("  Describe  This   Image in full detail. ")).toBe("describe this image in full detail")
+    expect(
+      normalizeQuestion("  Describe  This   Image in full detail, including ALL Text, UI Elements, diagrams, or content visible. "),
+    ).toBe("describe this image in full detail, including all text, ui elements, diagrams, or content visible")
     expect(normalizeQuestion("「解析图片」")).toBe("解析图片")
-    expect(normalizeQuestion("describe this image\nin full detail!")).toBe("describe this image in full detail")
+    expect(
+      normalizeQuestion(
+        "describe this image\nin full detail, including all text, ui elements, diagrams, or content visible!",
+      ),
+    ).toBe("describe this image in full detail, including all text, ui elements, diagrams, or content visible")
   })
 
   test("泛解析省略 question：落 GENERIC_QUESTION 单条；显式 canonical 与措辞变体跨实例命中", async () => {
@@ -1651,16 +1681,19 @@ describe("描述缓存落盘持久化（用户级目录 + LRU/容量）", () => 
     const clientC = makeStubClient()
     const { hooks: hooksC } = await loadPlugin(makePluginInput(dir, clientC), { models: ["test/vision-model"] })
     const third = await getAnalyze(hooksC)(
-      { image_path: persistedPath(), question: '  "DESCRIBE THIS IMAGE IN FULL DETAIL"  ' },
+      {
+        image_path: persistedPath(),
+        question: '  "DESCRIBE THIS IMAGE IN FULL DETAIL, INCLUDING ALL TEXT, UI ELEMENTS, DIAGRAMS, OR CONTENT VISIBLE"  ',
+      },
       toolCtx(new AbortController().signal),
     )
     expect(third.title).toBe("vision_analyze (cached)")
     expect(clientC.calls.prompt.length).toBe(0)
   })
 
-  test("存量旧默认条目兼容：磁盘已有 sha:GENERIC_QUESTION（旧版空 question 产物），省略 question 直接命中", async () => {
+  test("磁盘已有 canonical 条目时：省略 question 直接命中（key 固定，不重复描述）", async () => {
     await seedImage()
-    // 手工铺一个与旧版本（空 question → 默认串入 key）等价的条目
+    // 预置一条 GENERIC_QUESTION 键的条目（等价于此前任意一次泛解析落盘产物）
     await mkdir(descDir(), { recursive: true })
     await writeFile(
       descPath(GENERIC_QUESTION),

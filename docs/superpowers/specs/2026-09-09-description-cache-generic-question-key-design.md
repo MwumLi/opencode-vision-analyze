@@ -22,23 +22,24 @@ key 不一样，第二个会话就 miss，等于每会话各付一次视觉模�
 泛解析请求（用户只让描述整张图，没问具体点）的 question 统一改成固定文案：
 
 ```
-export const GENERIC_QUESTION = "Describe this image in full detail."
+export const GENERIC_QUESTION =
+  "Describe this image in full detail, including all text, UI elements, diagrams, or content visible."
 ```
 
-这个文案就是工具里现成的默认值（`src/index.ts` 空 question 时用它），所以不需要新造一段话，两处天然对齐。判断「这是不是泛解析」用精确匹配：去掉首尾引号、统一大小写和空白（含全角）、去掉末尾句点后，和 GENERIC_QUESTION 一致就算。不做模糊匹配、不收关键词表——误判会把针对性回答错误地套到泛解析上，宁可 miss 也不要错答。
+这个文案同时是工具的 `question` 参数默认值（schema `default` 字段，空 question 时用它兜底），所以主模型能看到"不填时是什么"，两处天然对齐。点名文字/UI/图表/可见内容，是让视觉模型把整图信息带全。判断「这是不是泛解析」用精确匹配：去掉首尾引号、统一大小写和空白（含全角）、去掉末尾句点后，和 GENERIC_QUESTION 一致就算。不做模糊匹配、不收关键词表——误判会把针对性回答错误地套到泛解析上，宁可 miss 也不要错答。
 
-改写后 key 仍是老格式 `<sha256>:<question>`，泛解析请求全部落在 `<sha>:Describe this image in full detail.` 这一条上：
+改写后 key 仍是老格式 `<sha256>:<question>`，泛解析请求全部落在 `<sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.` 这一条上：
 
 - 空 question / 省略 question / 各种措辞变体 → 同一 key，跨会话命中；
 - 针对性追问（问具体对象/文字/区域/颜色）→ question 原样保留，key 与旧版本逐字节相同，存量条目不受影响。
 
-不用裸 sha 当 key，理由：以后想改 GENERIC_QUESTION 的措辞，或想按用户/场景定制泛描述问题，只要问题文本变了 key 就自然分开，不会被历史缓存绑死；老条目成孤儿后由 LRU 按 mtime 清掉。这也顺带兼容老版本——老代码在空 question 时已经按这个默认串存过 key，升级后这些条目直接还能命中。
+不用裸 sha 当 key，理由：以后想改 GENERIC_QUESTION 的措辞，或想按用户/场景定制泛描述问题，只要问题文本变了 key 就自然分开，不会被历史缓存绑死；老条目成孤儿后由 LRU 按 mtime 清掉。本改动在 feature 分支、发版前落定文案，不存在老版本泛解析条目的迁移负担。
 
 泛解析走 canonical 这条写入路径时加一道门槛：描述文本少于 100 字符不入缓存。canonical 要求整图加逐字转录，正常结果不可能这么短，短文本大概率是视觉模型敷衍或拒绝产出，存进去会毒化这一条，让以后所有泛解析都拿到垃圾描述。
 
 ## 配套改动
 
-- `question` 参数语义改可选。工具描述里原来写着 "question … be specific"，等于在鼓励主模型每次换措辞，跟目标对着干，删掉，改成「省略则描述整图，填了则针对具体细节」。提示词（chat.message 注入的 synthetic 文本）也补一句同样的话：泛解析不要填 question，问具体点才填。两层文案同一口径。
+- `question` 参数语义改可选，且 schema 带 `default: GENERIC_QUESTION`、description 也写明默认串（防止运行时不透传 default 时模型看不到）。工具描述里原来写着 "question … be specific"，等于在鼓励主模型每次换措辞，跟目标对着干，删掉，改成「不填默认整图描述，问具体点才自己写」。提示词（chat.message 注入的 synthetic 文本）也补一句同样的话：泛解析不要填 question，问具体点才填。两层文案同一口径。
 - 不引入 experimental 的系统提示改写钩子，也不加"查该图已有缓存问题"之类的工具。先用最小改动跑一阵，看命中率够不够，不够再加。
 - `VISION_SYSTEM_PROMPT`（发给视觉子会话的那段）不动。
 
