@@ -15,7 +15,7 @@ A tool-based vision routing plugin for [opencode](https://opencode.ai): when the
 - **Tool-based, not pre-analysis.** The turn starts immediately; the model decides when (and with which question) to look. No blocking on submit, failures are visible and retryable inside the agent loop. Same philosophy as production-proven agent designs.
 - **Question-aware descriptions.** The model passes its own focused question to `vision_analyze` — not a one-shot generic caption computed at submit time. For a general parse of an image the model leaves `question` empty, and the tool falls back to a fixed prompt so all generic descriptions of the same image share one cache entry (see *Content-addressed cache*).
 - **Native fast path.** If the main model is vision-capable, `vision_analyze` skips the vision model entirely and returns the raw image as a tool attachment.
-- **Content-addressed cache.** Images are stored as content-addressed `<sha256>.<ext>` files in a **user-level shared directory** (`<cache>/opencode-vision-analyze/vision`, deduped across projects/sessions, LRU-capped 2000 entries / 500 MB); descriptions are cached per `<image-hash>:<question>` in a **user-level shared directory** (`<cache>/opencode-vision-analyze/descriptions`) — the same image with the same question is described exactly once, across projects, processes, and plugin restarts. The description cache is LRU-capped (2000 entries / 50 MB). Generic full-image parses (empty or omitted `question`) are normalised to a fixed prompt and all land on a single `<image-sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.` key, so the same "parse this image" request hits the cache across sessions when the main model omits the question or passes an equivalent wording.
+- **Content-addressed cache.** Images and descriptions are stored by content hash in user-level shared dirs and reused across sessions, projects and restarts — the same image is never described twice, and all generic full-image parses collapse onto that image's single entry. Storage layout, size limits and the canonical prompt are detailed in *Storage and caches* below.
 - **Unified auth.** The vision call runs through an opencode sub-session, so it reuses the provider credentials opencode already manages. No extra API key plumbing.
 
 ## Installation
@@ -69,10 +69,6 @@ Notes for the curl path:
 
 Supported image extensions: png / jpg / jpeg / gif / webp.
 
-Image storage: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/vision` regardless of git scope — one content-addressed `<sha256>.<ext>` file per unique image, shared across all projects. Pasted images and `http(s)` downloads are written here (atomic temp-file + rename, so concurrent opencode processes can safely share the store); **already-local image paths passed straight to the tool are read in place and never copied**. Defaults per platform: Linux `$XDG_CACHE_HOME || ~/.cache`, macOS `~/Library/Caches` (a `$XDG_CACHE_HOME` override is honored), Windows `%LOCALAPPDATA% || ~/AppData/Local`. An empty cache-root env var is treated as unset (falls back to the default). The store is LRU-capped (2000 entries / 500 MB; oldest by file mtime is evicted when either limit is exceeded), so no `.gitignore` entry is needed anywhere.
-
-Description cache: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/descriptions` regardless of git scope — one JSON entry per `<image-sha>:<effective-question>` key, named by `sha256(key)`. `question` is optional on the tool: a general full-image parse (empty or omitted) is normalised to the fixed prompt `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`, so every such request uses the key `<image-sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.` when its wording normalises to that prompt; specific follow-ups keep their own `<image-sha>:<question>` keys (format unchanged, existing entries keep hitting). Generic entries are only written when the description is long enough (≥ 100 chars), so a short refuse/fail answer can't poison the shared full-image entry. It is capped at 2000 entries / 50 MB with LRU eviction (oldest by file mtime is removed when either limit is exceeded). Writes are atomic (temp file + rename), so concurrent opencode processes can safely share the cache.
-
 An ordered-candidates example with auto-fallback and free-first discovery:
 
 ```jsonc
@@ -90,6 +86,12 @@ An ordered-candidates example with auto-fallback and free-first discovery:
   ]
 }
 ```
+
+### Storage and caches
+
+Image storage: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/vision` regardless of git scope — one content-addressed `<sha256>.<ext>` file per unique image, shared across all projects. Pasted images and `http(s)` downloads are written here (atomic temp-file + rename, so concurrent opencode processes can safely share the store); **already-local image paths passed straight to the tool are read in place and never copied**. Defaults per platform: Linux `$XDG_CACHE_HOME || ~/.cache`, macOS `~/Library/Caches` (a `$XDG_CACHE_HOME` override is honored), Windows `%LOCALAPPDATA% || ~/AppData/Local`. An empty cache-root env var is treated as unset (falls back to the default). The store is LRU-capped (2000 entries / 500 MB; oldest by file mtime is evicted when either limit is exceeded), so no `.gitignore` entry is needed anywhere.
+
+Description cache: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/descriptions` regardless of git scope — one JSON entry per `<image-sha>:<effective-question>` key, named by `sha256(key)`. `question` is optional on the tool: a general full-image parse (empty or omitted) is normalised to the fixed prompt `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`, so every such request uses the key `<image-sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.` when its wording normalises to that prompt; specific follow-ups keep their own `<image-sha>:<question>` keys (format unchanged, existing entries keep hitting). Generic entries are only written when the description is long enough (≥ 100 chars), so a short refuse/fail answer can't poison the shared full-image entry. It is capped at 2000 entries / 50 MB with LRU eviction (oldest by file mtime is removed when either limit is exceeded). Writes are atomic (temp file + rename), so concurrent opencode processes can safely share the cache.
 
 ## How it works
 
@@ -117,7 +119,7 @@ vision_analyze tool:
  ├─ description cache hit (image sha + effective question) → return cached text
  │    (general parses converge on <sha>:<canonical full-detail prompt>;
  │     persisted under <cache>/opencode-vision-analyze/descriptions,
- │     tagged with the model that produced it, LRU-capped 2000 entries / 50 MB)
+ │     tagged with the model that produced it)
  └─ candidate chain: sub-session under current session per candidate, in order —
       parentID, all tools disabled, dedicated system prompt, image + question
       sent to that vision model → first success returns → sub-session deleted
@@ -132,15 +134,7 @@ Key behaviors:
 - **Loginless free models** — auto-discovery uses `config.providers()`, the same source as the `/models` picker, so image-capable zen free models are found even without login (their provider is `custom` source → default last tier; put them first with `free_first: true`).
 - **The tool never throws** — every failure returns readable text so the agent loop can retry, rephrase, or inform the user.
 - **URL images** — `image_path` accepts `http(s)://...` URLs (must end in a supported image extension: png/jpg/jpeg/gif/webp).
-- **General parses share one cache entry** — `question` is optional and empty/omitted values are normalised to a fixed full-image prompt, so a repeated "parse this image" hits the disk cache across sessions when the main model omits the question or passes an equivalent wording. Specific follow-ups (an object/text/region/color) keep their own exact-key entries.
-
-## Known limitations
-
-- **V1 session flow only** — hooks are attached to the V1 `SessionPrompt` path; if opencode's default interaction moves to the V2 session core, hooks won't fire (silently).
-- **General-parse descriptions are English.** The canonical full-image prompt is fixed English; the returned description follows that language, and the main model is expected to relay it in the user's language.
-- **The canonical prompt is a contract.** `GENERIC_QUESTION` is baked into cache keys: changing its wording makes old generic entries unreachable (they age out via LRU). Deliberate — lets the prompt evolve or be customised per user/scenario without stale hits.
-- **Model non-compliance still costs once.** If the main model ignores the hint and passes a reworded generic question, it creates its own exact entry (one extra vision call, no wrong answers). Omission is the natural, hinted path.
-- **Switching vision models does not re-run general parses.** A generic entry is not re-computed just because the candidate chain changed; to force a fresh description, pass a non-canonical specific question once.
+- **General parses share one cache entry** — an empty or omitted `question` is treated as a full-image parse and reuses that image's cached description; specific follow-ups keep their own entries (details in *Storage and caches*).
 
 ## Roadmap
 
