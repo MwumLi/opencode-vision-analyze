@@ -905,10 +905,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
           question: {
             type: "string",
             description:
-              "Optional. Defaults to the full-image prompt: " +
-              JSON.stringify(GENERIC_QUESTION) +
-              ". Pass your own question only when the user asks about a specific object, text, region, or color.",
-            default: GENERIC_QUESTION,
+              "Optional. What specific detail to look for (object/text/region/color). Omit for a full description of the whole image.",
           },
         },
         execute: visionAnalyze,

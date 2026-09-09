@@ -267,9 +267,6 @@ describe("vision_analyze 工具", () => {
     expect(tool.description).not.toContain("be specific")
     const qDesc = String(tool.args["question"]["description"])
     expect(qDesc).toContain("Optional")
-    // 默认值即 canonical：模型能看到“不填时是什么”，需要具体追问时才覆盖
-    expect(String(tool.args["question"]["default"])).toBe(GENERIC_QUESTION)
-    expect(qDesc).toContain(GENERIC_QUESTION)
   })
 
   test("描述路径：创建子会话调用视觉模型并返回描述，子会话用后即删", async () => {

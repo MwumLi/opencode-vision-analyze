@@ -4,7 +4,7 @@
 > 分支：`feat/description-cache-generic-key`（基于 main @ 0.4.0）
 > 门禁：`bun run typecheck && bun test && bun run build`。TDD：先写会失败的测试，再改源码。
 > 交付后不自行 push / merge / 发版。
-> 迭代内修订（review 反馈）：canonical 文案扩为点名文字/UI/图表/可见内容的完整句；question schema 增 `default: GENERIC_QUESTION`；chat.message hint 维持"省略 question"口径不动。
+> 迭代内修订（review 反馈）：canonical 文案扩为点名文字/UI/图表/可见内容的完整句；回归实测后移除 question 的 schema default（默认值非命中杠杆，描述内容与 question 无关），保留 hint 引导省略与 canonical 归一化。
 
 ## 任务拆解
 
@@ -16,7 +16,7 @@
 3. 源码（绿）：`src/index.ts`
    - 导出 `GENERIC_QUESTION`、`genericWriteMinText = { chars: 100 }`、`normalizeQuestion`、`isGenericQuestion`。
    - `visionAnalyze` 内：默认串改引 `GENERIC_QUESTION`；按 isGeneric 改写 question；写盘处加 generic 最短长度门槛。
-   - 工具 description / args.question 文案改可选，args.question 增加 `default: GENERIC_QUESTION` 且 description 写明默认串；chat.message hint 追加「泛解析省略 question」。
+   - 工具 description / args.question 文案改可选（schema 不挂 default）；chat.message hint 追加「泛解析省略 question」。
    - 运行 `bun test` 全绿。
 4. 文档：README.md / README.zh.md 缓存段与已知限制；`src/index.ts` 头注释。
 5. 门禁：`bun run typecheck && bun test && bun run build`。
