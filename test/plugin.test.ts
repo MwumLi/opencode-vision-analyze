@@ -265,7 +265,11 @@ describe("vision_analyze 工具", () => {
     // 契约：question 语义为可选，且不能再用旧文案鼓励“具体一点”（那会诱导措辞分化，破坏泛解析收敛）
     expect(tool.description).toContain("question is optional")
     expect(tool.description).not.toContain("be specific")
-    expect(String(tool.args["question"]["description"])).toContain("Optional")
+    const qDesc = String(tool.args["question"]["description"])
+    expect(qDesc).toContain("Optional")
+    // 默认值即 canonical：模型能看到“不填时是什么”，需要具体追问时才覆盖
+    expect(String(tool.args["question"]["default"])).toBe(GENERIC_QUESTION)
+    expect(qDesc).toContain(GENERIC_QUESTION)
   })
 
   test("描述路径：创建子会话调用视觉模型并返回描述，子会话用后即删", async () => {
