@@ -158,6 +158,48 @@ export const visionCacheLimits = {
 }
 
 /**
+ * 泛解析（描述整张图）用的固定问题文案。
+ *
+ * 主模型对「解析这张图 / 描述图片」这类请求应省略 question，由工具用这里的文案兜底，
+ * 从而让所有泛解析请求的缓存 key 收敛到同一条（key = <图片sha>:GENERIC_QUESTION），
+ * 避免主模型每次自编措辞把缓存拆成多份、跨会话永远命中不了。
+ *
+ * 这份文案相当于公开契约：改动它会让旧的泛解析缓存条目失去命中（由 LRU 按 mtime 清理），
+ * 属于刻意为之——将来想改泛描述措辞、或按用户/场景定制时，改文案即可自然分开新旧缓存。
+ */
+export const GENERIC_QUESTION = "Describe this image in full detail."
+
+/**
+ * 泛解析缓存条目的最短文本长度（字符）。
+ *
+ * canonical 描述要求整图加逐字转录，正常结果不可能太短；太短多半是视觉模型敷衍或拒答。
+ * 泛解析条目是全图共享的，存进一条垃圾描述会让之后所有泛解析都命中它，所以写入时长度
+ * 低于该值就跳过。具体追问不受限制（“答案是 42”是合法答案）。
+ * 做成模块级可变对象，测试注入大值/小值验证两侧行为。
+ */
+export const genericWriteMinText = { chars: 100 }
+
+/**
+ * 归一化问题文本，供「是否为泛解析」判定使用：
+ * 去掉首尾空白与引号/括号，把连续空白（含全角/换行）折成一个空格，去掉句末标点，统一小写。
+ * 只做字符级归一化，不做语义匹配——误判泛解析会把针对性回答套到错误语义上，宁可 miss。
+ */
+export function normalizeQuestion(q: string): string {
+  return q
+    .trim()
+    .replace(/^[\s"'“”「」『』()（）\[\]]+|[\s"'“”「」『』()（）\[\]]+$/g, "")
+    .replace(/[\s]+/g, " ")
+    .replace(/[.。!！?？]+$/g, "")
+    .toLowerCase()
+}
+
+/** 是否泛解析请求：没给问题（空/纯空白），或归一化后与 GENERIC_QUESTION 一致。 */
+export function isGenericQuestion(q: string): boolean {
+  const s = (q ?? "").trim()
+  return s === "" || normalizeQuestion(s) === normalizeQuestion(GENERIC_QUESTION)
+}
+
+/**
  * http(s) 下载图片的大小上限（20 MB）。提示注入可让模型指向超大图片，
  * 下载不限长是成本/健壮性放大器：先按 content-length 头提前拒绝，
  * 读取后再按实际字节数复核（防御不带 content-length 的响应）。
@@ -585,12 +627,18 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * 自行决定下一步（重试、换问题或告知用户）。
    */
   const visionAnalyze = async (
-    args: { image_path: string; question: string },
+    args: { image_path: string; question?: string },
     ctx: ToolContext,
   ): Promise<ToolResult> => {
     const title = "vision_analyze"
     try {
-      const question = args.question?.trim() || "Describe this image in full detail."
+      // 泛解析判定：没给问题（空/纯空白），或措辞与 GENERIC_QUESTION 归一化一致。
+      // 泛解析请求统一改写为 GENERIC_QUESTION——缓存 key 固定成 <图片sha>:GENERIC_QUESTION，
+      // 跨会话、跨措辞都能命中；主模型若问的是具体对象/文字/区域/颜色，则保留原问句，
+      // 走各自的精确 key（与旧版本格式一致，存量条目不受影响）。
+      const trimmed = args.question?.trim() ?? ""
+      const generic = trimmed === "" || isGenericQuestion(trimmed)
+      const question = generic ? GENERIC_QUESTION : trimmed
       // http(s) URL：先下载到用户级 vision 缓存目录，再统一走磁盘加载路径。
       // ctx.abort 传入下载：用户中止即刻断下载（含 pre-abort 不再发请求）。
       const download = /^https?:\/\//i.test(args.image_path)
@@ -622,7 +670,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         }
       }
 
-      // 描述缓存：内容哈希 + 问题作为 key，命中直接复用（title 标注 cached）。
+      // 描述缓存：内容哈希 + 生效问题作为 key，命中直接复用（title 标注 cached）。
       // 落盘在用户级共享目录（resolveDescriptionDir）——跨项目/进程/重启命中；磁盘即事实。
       const key = `${createHash("sha256").update(image.bytes).digest("hex")}:${question}`
       const cached = await descCacheGet(key)
@@ -634,6 +682,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
 
       const result = await describeWithChain(image, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
+      // 泛解析条目是全图共享的：文本太短多半是视觉模型敷衍/拒答，存进去会毒化这条
+      // canonical 缓存，让以后所有泛解析都命中垃圾描述，所以低于门槛就跳过落盘。
+      // 具体追问不受限（"答案是 42" 是合法短答案）。
+      if (generic && result.text.length < genericWriteMinText.chars) {
+        return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
+      }
       // 入库带上实际产出描述的候选 modelId，供后续缓存命中还原真实标签
       await descCacheSet(key, { modelId: result.modelId, text: result.text })
       // 成功标签直接用实际产出描述的候选引用键（而非链首近似）
@@ -810,6 +864,13 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     }
     if (lines.length === 0) return
 
+    // 泛解析指引：主模型对"描述整图/解析图片"这类请求应省略 question（工具内部会用固定
+    // canonical 文案兜底，缓存 key 才能跨会话收敛）；只有用户问具体对象/文字/区域/颜色时才
+    // 填具体问句。措辞分化的泛问句会让缓存 key 拆碎、永远命中不了。
+    lines.push(
+      "[When the user asks for a general parse of the whole image, call vision_analyze WITHOUT a question (omit the question parameter). Only pass a question when the user asks about a specific object, text, region, or color.]",
+    )
+
     // 注入 synthetic text part：TUI 隐藏（不干扰用户输入展示），但会发给模型。
     // id 需满足 PartID 约定（prt 前缀）。
     const hint: TextPart = {
@@ -832,10 +893,14 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     tool: {
       vision_analyze: {
         description:
-          "Analyze an image with the dedicated vision model. image_path is an absolute file path (as given in the user's attachment hint) or an http(s) image URL. question describes what to look for; be specific.",
+          "Analyze an image with the dedicated vision model. image_path is an absolute file path (as given in the user's attachment hint) or an http(s) image URL. question is optional: pass it only when you need a specific detail (an object, text, region or color); otherwise omit it to get a full description of the whole image.",
         args: {
           image_path: { type: "string", description: "Absolute path to the image file, or an http(s) image URL." },
-          question: { type: "string", description: "What to look for or answer about the image." },
+          question: {
+            type: "string",
+            description:
+              "Optional. What specific detail to look for (object/text/region/color). Omit for a full description of the whole image.",
+          },
         },
         execute: visionAnalyze,
       },
