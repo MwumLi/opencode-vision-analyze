@@ -135,12 +135,9 @@ Key behaviors:
 ## Known limitations
 
 - **V1 session flow only** — hooks are attached to the V1 `SessionPrompt` path; if opencode's default interaction moves to the V2 session core, hooks won't fire (silently).
-- **Historical images** — images from messages sent before the plugin was enabled can't be described (no hint, no path on disk).
-- **Cache bounds** — image store and description cache are both user-level and LRU-capped: images 2000 entries / 500 MB, descriptions 2000 entries / 50 MB.
 
 ## Roadmap
 
-- [x] Persistent description cache (content-addressed on disk, with LRU / size cap)
 - [ ] Region cropping for zooming into image details
 
 ## Development
