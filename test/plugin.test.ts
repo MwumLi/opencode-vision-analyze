@@ -1603,6 +1603,7 @@ describe("描述缓存落盘持久化（用户级目录 + LRU/容量）", () => 
     expect(isGenericQuestion("「describe this image in full detail」")).toBe(true)
     expect(isGenericQuestion("Describe this image in full detail")).toBe(true)
     expect(isGenericQuestion("describe this image in full detail?")).toBe(true)
+    expect(isGenericQuestion("describe\u3000this\u3000image\u3000in\u3000full\u3000detail")).toBe(true)
     // 具体追问：既有用例用词、针对性问句、带 canonical 句子的追问都不能误判为泛解析
     expect(isGenericQuestion("persist me")).toBe(false)
     expect(isGenericQuestion("who labels")).toBe(false)
