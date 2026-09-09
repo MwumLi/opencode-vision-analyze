@@ -20,7 +20,7 @@
 4. 文档：README.md / README.zh.md 缓存段与已知限制；`src/index.ts` 头注释。
 5. 门禁：`bun run typecheck && bun test && bun run build`。
 6. 分逻辑 commit：docs → test(red) → src(green) → docs。
-7. 交付 review。
+7. 交付 review（含议会验收 + 用户 checklist 验收）。
 
 ## 新增用例清单（测试块）
 
