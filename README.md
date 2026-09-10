@@ -89,7 +89,7 @@ An ordered-candidates example with auto-fallback and free-first discovery:
 
 ### Storage and caches
 
-Image storage: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/vision` regardless of git scope — one content-addressed `<sha256>.<ext>` file per unique image, shared across all projects. Pasted images and `http(s)` downloads are written here (atomic temp-file + rename, so concurrent opencode processes can safely share the store); **already-local image paths passed straight to the tool are read in place and never copied**. Defaults per platform: Linux `$XDG_CACHE_HOME || ~/.cache`, macOS `~/Library/Caches` (a `$XDG_CACHE_HOME` override is honored), Windows `%LOCALAPPDATA% || ~/AppData/Local`. An empty cache-root env var is treated as unset (falls back to the default). The store is LRU-capped (2000 entries / 500 MB; oldest by file mtime is evicted when either limit is exceeded), so no `.gitignore` entry is needed anywhere.
+Image storage: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/vision` regardless of git scope — one content-addressed `<sha256>.<ext>` file per unique image, shared across all projects. **Path-pasted attachments** (the message part carries a real source path, e.g. a file path copied to the clipboard) and **already-local paths passed straight to the tool** are read in place and never copied — the file's current content is read at analysis time, so re-pasting a path always analyses the latest content. Only clipboard images (raw pixels, no source path) and `http(s)` downloads are written here (atomic temp-file + rename, so concurrent opencode processes can safely share the store). Defaults per platform: Linux `$XDG_CACHE_HOME || ~/.cache`, macOS `~/Library/Caches` (a `$XDG_CACHE_HOME` override is honored), Windows `%LOCALAPPDATA% || ~/AppData/Local`. An empty cache-root env var is treated as unset (falls back to the default). The store is LRU-capped (2000 entries / 500 MB; oldest by file mtime is evicted when either limit is exceeded), so no `.gitignore` entry is needed anywhere.
 
 Description cache: stored in a **user-level shared directory** `<cache>/opencode-vision-analyze/descriptions` regardless of git scope — one JSON entry per `<image-sha>:<effective-question>` key, named by `sha256(key)`. `question` is optional on the tool: a general full-image parse (empty or omitted) is normalised to the fixed prompt `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`, so every such request uses the key `<image-sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.` when its wording normalises to that prompt; specific follow-ups keep their own `<image-sha>:<question>` keys (format unchanged, existing entries keep hitting). Generic entries are only written when the description is long enough (≥ 100 chars), so a short refuse/fail answer can't poison the shared full-image entry. It is capped at 2000 entries / 50 MB with LRU eviction (oldest by file mtime is removed when either limit is exceeded). Writes are atomic (temp file + rename), so concurrent opencode processes can safely share the cache.
 
@@ -102,9 +102,11 @@ User pastes image + question
      ├─ main model has image input capability → do nothing (raw image goes to model)
      ├─ no image-capable model available → do nothing (no hint, no persist;
      │    core's default image handling applies)
-     └─ text-only main model → persist image to the user-level vision store
-        (<sha256>.<ext> under <cache>/opencode-vision-analyze/vision;
-         already-local file paths are read in place, never copied)
+     └─ text-only main model → resolve a stable image path:
+        path-pasted attachments use the source path in place (never copied,
+        always the latest file content); clipboard images are persisted to
+        the user-level vision store (<sha256>.<ext> under
+        <cache>/opencode-vision-analyze/vision)
         and inject a synthetic hint (hidden in TUI, visible to model):
         "use the vision_analyze tool with image_path: ..."
 

@@ -84,8 +84,8 @@ function toolCtx(signal: AbortSignal) {
   return makeToolContext({ sessionID: "ses_1", directory: dir, signal })
 }
 
-/** 构造一个图片 file part（模拟用户贴图）。 */
-function imagePart() {
+/** 构造一个图片 file part（模拟用户贴图）；可注入 source 等字段覆盖。 */
+function imagePart(overrides: Record<string, unknown> = {}) {
   return {
     id: "prt_input_1",
     sessionID: "ses_1",
@@ -94,6 +94,7 @@ function imagePart() {
     mime: "image/png",
     url: TINY_PNG_DATA_URL,
     filename: "tiny.png",
+    ...overrides,
   }
 }
 
@@ -194,6 +195,96 @@ describe("chat.message 钩子", () => {
 
     // 图片按内容哈希落盘
     expect(await fileExists(persistedPath())).toBe(true)
+  })
+
+  test("路径粘贴（source.path 指向真实图片）：原位读用、不落盘", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const srcPath = path.join(dir, "src.png")
+    await writeFile(srcPath, TINY_PNG)
+    const out = chatOutput([
+      imagePart({ source: { type: "file", path: srcPath, text: { value: "[Image 1]", start: 0, end: 9 } } }),
+    ])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+
+    const hint = out.parts[1] as { type: string; text: string }
+    expect(hint.text).toContain(`image_path: ${srcPath}`)
+    // 路径粘贴不复制进 vision 缓存
+    expect(await fileExists(persistedPath())).toBe(false)
+  })
+
+  test("路径粘贴（相对路径）：以 input.directory 为基准绝对化、不落盘", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const rel = path.join("sub", "x.png")
+    await mkdir(path.join(dir, "sub"), { recursive: true })
+    await writeFile(path.join(dir, rel), TINY_PNG)
+    const out = chatOutput([
+      imagePart({ source: { type: "file", path: rel, text: { value: "[Image 1]", start: 0, end: 9 } } }),
+    ])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+
+    const hint = out.parts[1] as { text: string }
+    expect(hint.text).toContain(`image_path: ${path.resolve(dir, rel)}`)
+    expect(await fileExists(persistedPath())).toBe(false)
+  })
+
+  test("路径粘贴但源文件不存在：回退内容寻址落盘", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const out = chatOutput([
+      imagePart({
+        source: { type: "file", path: path.join(dir, "nope.png"), text: { value: "[Image 1]", start: 0, end: 9 } },
+      }),
+    ])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+
+    const hint = out.parts[1] as { text: string }
+    expect(hint.text).toContain(`image_path: ${persistedPath()}`)
+    expect(await fileExists(persistedPath())).toBe(true)
+  })
+
+  test("路径粘贴但扩展名不受支持：回退内容寻址落盘", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const binPath = path.join(dir, "foo.bin")
+    await writeFile(binPath, TINY_PNG)
+    const out = chatOutput([
+      imagePart({ source: { type: "file", path: binPath, text: { value: "[Image 1]", start: 0, end: 9 } } }),
+    ])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+
+    const hint = out.parts[1] as { text: string }
+    expect(hint.text).toContain(`image_path: ${persistedPath()}`)
+    expect(await fileExists(persistedPath())).toBe(true)
+  })
+
+  test("路径粘贴：源文件内容变化后，vision_analyze 取最新内容", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const analyze = getAnalyze(hooks)
+    const srcPath = path.join(dir, "live.png")
+    await writeFile(srcPath, TINY_PNG)
+
+    const out = chatOutput([
+      imagePart({ source: { type: "file", path: srcPath, text: { value: "[Image 1]", start: 0, end: 9 } } }),
+    ])
+    await hooks["chat.message"](chatInput({ sessionID: "ses_1", model: MAIN_MODEL }), out)
+    const hint = out.parts[1] as { text: string }
+    expect(hint.text).toContain(`image_path: ${srcPath}`)
+
+    // 粘贴后文件内容被改写 → 工具当场重读应拿到新内容（而非消息里的旧快照）
+    const next = Buffer.from("brand new image bytes")
+    await writeFile(srcPath, next)
+
+    const result = await analyze(
+      { image_path: srcPath, question: "what is this?" },
+      toolCtx(new AbortController().signal),
+    )
+    expect(result.title).toBe("vision_analyze")
+    const parts = client.calls.prompt[0]?.parts as Array<Record<string, unknown>>
+    const filePart = parts.find((p) => p["type"] === "file") as { url: string }
+    expect(filePart.url).toBe(`data:image/png;base64,${next.toString("base64")}`)
   })
 
   test("有视觉主模型带图：不注入提示、不落盘（能力门控）", async () => {
