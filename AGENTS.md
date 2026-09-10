@@ -13,7 +13,8 @@
 ### 常用命令
 
 ```bash
-npm version patch              # 0.1.x → 0.1.(x+1)，commit + tag v0.1.x，自动推送发布
+npm version minor              # 新功能：0.5.0 → 0.6.0，commit + tag v0.6.0，自动推送发布
+npm version patch              # 修 bug：0.1.x → 0.1.(x+1)，commit + tag v0.1.x，自动推送发布
 npm version 1.2.0              # 显式指定完整版本
 npm version prerelease --preid beta   # beta 冒烟：0.1.1 → 0.1.2-beta.0
 ```
@@ -37,7 +38,7 @@ npm version patch
 - `npm version` 要求工作区干净：有未提交改动会拒绝执行（先 commit 或 stash）。
 - `postversion` 的 push 若失败（网络/凭据），版本已 bump 但未推送：手动补
   `git push --follow-tags` 即可。
-- 0.x 阶段用 `patch` / 显式版本号（`major` 会从 0.x 跳到 1.0.0）。
+- 0.x 阶段：新功能用 `npm version minor`（或显式版本号），修 bug 用 `patch`；**不要用 `major`**（会从 0.x 直接跳到 1.0.0）。
 
 ## 测试
 
