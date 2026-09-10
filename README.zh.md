@@ -89,9 +89,34 @@ curl 方式说明：
 
 ### 存储与缓存
 
-图片存储：**恒定放用户级共享目录** `<cache>/opencode-vision-analyze/vision`（与 git / 非 git 分域无关），同一用户所有项目共享；每个唯一图片一个内容寻址 `<sha256>.<ext>` 文件。贴图与 http(s) 下载写入于此（临时文件 + rename 原子写，多个 opencode 进程可安全共享）；**模型直接把本地已存在文件路径传给工具时不复制、原位读用**。各平台默认：Linux `$XDG_CACHE_HOME || ~/.cache`；macOS `~/Library/Caches`（亦接受 `$XDG_CACHE_HOME` 覆盖）；Windows `%LOCALAPPDATA% || ~/AppData/Local`。缓存根 env 为空串视为未设置（回退默认）。图片缓存 LRU 上限 2000 条 / 500MB，任一超限即按文件 mtime 淘汰最久未用的条目——无需任何 `.gitignore` 条目。
+两套**用户级共享缓存**并列在 `<cache>/opencode-vision-analyze/` 下，跨会话 / 项目 / 重启共享，与 git 分域无关，无需任何 `.gitignore`。
 
-描述缓存：**恒定放用户级共享目录** `<cache>/opencode-vision-analyze/descriptions`（与 git / 非 git 分域无关）——每条目一个 JSON 文件，key 为 `<图片sha256>:<生效问题>`、文件名取 `sha256(key)`。`question` 参数可选：描述整张图的泛解析（空 / 省略）会归一化到固定文案 `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`，措辞与固定文案归一化等价时即落在 key `<图片sha>:Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`；具体追问保留原问句走各自的 `<图片sha>:<问题>` key（格式与旧版一致，存量条目照常命中）。泛解析条目要求描述文本 ≥ 100 字符才写入，防止视觉模型敷衍/拒答的短文本毒化整图共享条目。容量上限 2000 条 / 50MB，任一超限即按文件 mtime 淘汰最久未用的条目（LRU）。写入为原子操作（临时文件 + rename），多个 opencode 进程可安全共享同一描述缓存。
+| 缓存 | 目录 | 内容 | 命名 | 容量上限 |
+|---|---|---|---|---|
+| 图片 | `vision/` | 图片字节 | `<sha256>.<ext>` | 2000 条 / 500MB |
+| 描述 | `descriptions/` | 描述文本（JSON） | `sha256(key)` | 2000 条 / 50MB |
+
+**图片存储（`vision/`）**
+
+- **写入缓存**：剪贴板位图（无源路径）与 `http(s)` 下载。
+- **原位读用（不复制）**：路径粘贴（消息 part 带真实 `source.path`，如复制到剪贴板的文件路径）与模型直接传入的本地文件路径——分析时当场重读，故同一路径每次粘贴都取最新内容。
+- **淘汰**：按文件 mtime LRU；超出 2000 条或 500MB 即删最久未用的条目。
+- **并发安全**：临时文件 + rename 原子写，多个 opencode 进程可安全共享。
+
+**描述缓存（`descriptions/`）**
+
+- **key**：`<图片sha256>:<生效问题>`，文件名取 `sha256(key)`。
+- **泛解析（`question` 空 / 省略）**：归一化到固定文案 `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`，所有泛解析收敛到同一条。
+- **具体追问**：保留原问句，走各自的 `<图片sha256>:<问题>` key（格式与旧版一致，存量条目照常命中）。
+- **写入门槛**：泛解析条目要求描述 ≥ 100 字符，防止视觉模型敷衍/拒答的短文本毒化共享条目。
+- **淘汰**：按文件 mtime LRU，上限 2000 条 / 50MB；**并发安全**同上。
+
+**平台默认缓存根**
+
+- Linux：`$XDG_CACHE_HOME || ~/.cache`
+- macOS：`~/Library/Caches`（亦接受 `$XDG_CACHE_HOME` 覆盖）
+- Windows：`%LOCALAPPDATA% || ~/AppData/Local`
+- 空串 env 视为未设置，回退默认。
 
 ## 工作原理
 
@@ -102,9 +127,10 @@ curl 方式说明：
      ├─ 主模型支持图片输入 → 不做任何处理（原图直发）
      ├─ 无任何 image-capable 模型 → 不做处理（不注入 hint、不落盘；
      │    交给核心对图片的默认处理）
-     └─ 纯文本主模型 → 图片落盘到用户级 vision 存储
-        （<sha256>.<ext>；位于 <cache>/opencode-vision-analyze/vision；
-         本地已存在文件路径原位读用、不复制）
+     └─ 纯文本主模型 → 解析出稳定 image_path：
+        路径粘贴用源文件路径原位读用（不复制、始终取最新内容）；
+        剪贴板位图落盘到用户级 vision 存储
+        （<sha256>.<ext>；位于 <cache>/opencode-vision-analyze/vision）
         并注入 synthetic 提示（TUI 隐藏、模型可见）：
         "用 vision_analyze 工具查看，image_path: ..."
 

@@ -2,10 +2,12 @@
  * opencode-vision-analyze
  *
  * 为「不具备视觉能力的主模型」提供图片解读路由：当用户在消息中附带图片时，
- * 插件把图片落盘到**用户级共享目录**（<cache>/opencode-vision-analyze/vision，
- * 恒用户级、与 git/非 git 无关），并向模型注入一条 synthetic 提示
- * （TUI 界面隐藏、模型可见），引导它通过 vision_analyze 工具让指定的视觉
- * 模型描述图片。若主模型本身支持图片输入，则不做任何干预，原图直接发给主模型。
+ * 插件解析出一个稳定的图片绝对路径（**路径粘贴**——part 带真实 source.path——
+ * 直接原位读用、不复制；**复制图片本身**（剪贴板位图）等无有效源路径时才落盘到
+ * 用户级共享目录 <cache>/opencode-vision-analyze/vision，恒用户级、与 git/非 git
+ * 无关），并向模型注入一条 synthetic 提示（TUI 界面隐藏、模型可见），引导它通过
+ * vision_analyze 工具让指定的视觉模型描述图片。若主模型本身支持图片输入，则不做
+ * 任何干预，原图直接发给主模型。
  *
  * 工作方式（vision_analyze 工具路径）：主模型调用 vision_analyze 时，插件
  * 创建一个 parentID 挂在当前会话下的临时子会话（不进会话列表、不生成
@@ -20,8 +22,8 @@
  * 泛解析条目是全图共享的，写入前按最短文本长度把关，防一条垃圾描述毒化整图。
  * image_path 除了绝对路径也接受 http(s) URL：先下载落盘到同一用户级 vision
  * 目录（内容哈希命名，天然与附件落盘去重；LRU + 容量上限，2000 条 / 500MB），
- * 再走统一的磁盘加载路径。**本地已存在的文件直接原位读取**（不复制、不 touch），
- * 只有贴图/下载才写缓存。
+ * 再走统一的磁盘加载路径。**路径粘贴与本地已存在的文件直接原位读取**（不复制、
+ * 不 touch，始终读文件最新内容）；只有剪贴板贴图/下载才写缓存。
  * 主模型本身支持图片输入时走快速路径：不做子会话描述，直接把原图作为
  * 工具附件回传给模型自行查看。
  *
@@ -822,6 +824,33 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   }
 
   /**
+   * 解析图片 part 的可用绝对路径：
+   * - **路径粘贴**（part 带真实 source.path）：原位读用，不复制进 vision 缓存。相对路径
+   *   以 input.directory 为基准绝对化，与 opencode 工具一致（tool/read.ts 等用
+   *   path.resolve(instance.directory, filepath)）。提示里给绝对路径，vision_analyze
+   *   每次调用当场重读该文件 → 始终分析最新内容；描述缓存按内容 sha，天然不缓存旧内容。
+   * - **复制图片本身**（剪贴板位图，source.path="clipboard"）、无 source、扩展名不受支持、
+   *   文件缺失/为空 → 回退 persistImage 内容寻址落盘（贴图必须给模型稳定 image_path）。
+   * 判定失败一律回退，绝不抛错（fail-open）。
+   */
+  const resolveImagePath = async (part: FilePart): Promise<string | undefined> => {
+    const src = part.source
+    if (src?.type === "file" && src.path) {
+      const abs = path.isAbsolute(src.path) ? src.path : path.resolve(input.directory, src.path)
+      const ext = path.extname(abs).toLowerCase()
+      if (EXT_MIME[ext]) {
+        try {
+          const st = await fs.stat(abs)
+          if (st.isFile() && st.size > 0) return abs
+        } catch {
+          // 缺失/不可读 → 回退落盘
+        }
+      }
+    }
+    return (await persistImage(part))?.filepath
+  }
+
+  /**
    * chat.message 钩子：用户消息持久化前触发（parts 数组与持久化同引用，
    * push 进去的 part 会一并入库）。
    *
@@ -831,7 +860,8 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * 3. 递归防护——消息模型 ∈ 候选链全体成员（我们的描述子会话）则放行；
    * 4. 能力门控——主模型本身能看图则不注入提示；
    * 5. 空链降级——没有任何可用视觉模型时不注入 hint；
-   * 6. 图片落盘，并注入一条 synthetic text part 引导模型使用 vision_analyze。
+   * 6. 解析图片路径（路径粘贴原位读用、其余落盘），并注入一条 synthetic text part
+   *    引导模型使用 vision_analyze。
    */
   const onChatMessage: NonNullable<Hooks["chat.message"]> = async (hookInput, output) => {
     // 记录会话当前模型，供后续 vision_analyze 快速路径与未显式指定 model 的
@@ -860,13 +890,13 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     const chain = await resolveChain()
     if (chain.length === 0) return
 
-    // 每张图落盘并生成两行提示；任何一张落盘失败就跳过该图（不影响其余图片）。
+    // 每张图解析路径并生成两行提示；任一张解析失败就跳过该图（不影响其余图片）。
     const lines: string[] = []
     for (const part of images) {
-      const persisted = await persistImage(part)
-      if (!persisted) continue
+      const imagePath = await resolveImagePath(part)
+      if (!imagePath) continue
       lines.push(`[The user attached an image: ${part.filename ?? "image"}]`)
-      lines.push(`[Examine it with the vision_analyze tool using image_path: ${persisted.filepath}]`)
+      lines.push(`[Examine it with the vision_analyze tool using image_path: ${imagePath}]`)
     }
     if (lines.length === 0) return
 
