@@ -29,6 +29,8 @@ import {
   chatInput,
   providerStub,
   providersStub,
+  makePng,
+  makeExifJpeg,
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
@@ -42,6 +44,17 @@ import {
   genericWriteMinText,
   isGenericQuestion,
   normalizeQuestion,
+  imageSize,
+  readExifOrientation,
+  parseRegion,
+  isWholeImageRegion,
+  regionKey,
+  regionToPixels,
+  buildCropArgs,
+  cropEngineCandidates,
+  cropRunner,
+  detectCropEngine,
+  regionGenericMinText,
 } from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
@@ -1855,5 +1868,135 @@ describe("描述缓存落盘持久化（用户级目录 + LRU/容量）", () => 
       genericWriteMinText.chars = saved
     }
   })
+})
+
+// ---- 区域裁剪：纯函数 --------------------------------------------------------
+
+describe("imageSize 图片尺寸嗅探", () => {
+  test("PNG：读 IHDR 宽高，orientation=1", () => {
+    expect(imageSize(makePng(2, 3))).toEqual({ width: 2, height: 3, orientation: 1 })
+    expect(imageSize(TINY_PNG)).toEqual({ width: 1, height: 1, orientation: 1 })
+  })
+
+  test("截断/非法字节：返回 undefined（不猜）", () => {
+    expect(imageSize(Buffer.from("not an image"))).toBeUndefined()
+    expect(imageSize(TINY_PNG.subarray(0, 10))).toBeUndefined()
+  })
+
+  test("JPEG orientation=6（5-8）时交换宽高为显示尺寸", () => {
+    const jpeg = makeExifJpeg(3, 2, 6)
+    expect(readExifOrientation(jpeg)).toBe(6)
+    expect(imageSize(jpeg)).toEqual({ width: 2, height: 3, orientation: 6 })
+  })
+
+  test("JPEG orientation=1 不交换宽高", () => {
+    expect(imageSize(makeExifJpeg(3, 2, 1))).toEqual({ width: 3, height: 2, orientation: 1 })
+  })
+})
+
+describe("region 校验 / 映射 / 命令构造", () => {
+  test("parseRegion：合法通过；越界/长度错/非数/逆序拒绝", () => {
+    expect(parseRegion([0, 0, 500, 500])).toEqual({ x1: 0, y1: 0, x2: 500, y2: 500 })
+    expect(parseRegion([0, 0, 1001, 500])).toBeUndefined()
+    expect(parseRegion([0, 0, 500])).toBeUndefined()
+    expect(parseRegion([0, 0, "x", 500])).toBeUndefined()
+    expect(parseRegion([500, 0, 100, 500])).toBeUndefined()
+    expect(parseRegion(undefined)).toBeUndefined()
+  })
+
+  test("isWholeImageRegion 识别整图哨兵", () => {
+    expect(isWholeImageRegion({ x1: 0, y1: 0, x2: 1000, y2: 1000 })).toBe(true)
+    expect(isWholeImageRegion({ x1: 0, y1: 0, x2: 999, y2: 1000 })).toBe(false)
+  })
+
+  test("regionToPixels：floor 左/上、ceil 右/下，并 clamp", () => {
+    // 101px 的 50% = 50.5：left=floor(50.5)=50，right=ceil(101)=101 → 宽 51
+    expect(regionToPixels({ x1: 0, y1: 0, x2: 500, y2: 500 }, { width: 101, height: 101 })).toEqual({
+      left: 0,
+      top: 0,
+      width: 51,
+      height: 51,
+    })
+    // 越界 clamp 到整图
+    expect(regionToPixels({ x1: 0, y1: 0, x2: 1000, y2: 1000 }, { width: 10, height: 10 })).toEqual({
+      left: 0,
+      top: 0,
+      width: 10,
+      height: 10,
+    })
+  })
+
+  test("regionToPixels：极窄区域不塌缩（ceil 保证 ≥1px）", () => {
+    const rect = regionToPixels({ x1: 0, y1: 0, x2: 1, y2: 1 }, { width: 100, height: 100 })
+    expect(rect).toEqual({ left: 0, top: 0, width: 1, height: 1 })
+  })
+
+  test("regionKey 用原始归一化值", () => {
+    expect(regionKey({ x1: 10, y1: 20, x2: 300, y2: 400 })).toBe("r10,20,300,400")
+  })
+
+  test("buildCropArgs：magick 带 -auto-orient 与帧选择；ffmpeg 用 crop 滤镜", () => {
+    const rect = { left: 1, top: 2, width: 30, height: 40 }
+    expect(buildCropArgs("magick", "/in.png", rect, "/out.png")).toEqual([
+      "/in.png[0]", "-auto-orient", "-crop", "30x40+1+2", "+repage", "/out.png",
+    ])
+    expect(buildCropArgs("ffmpeg", "/in.png", rect, "/out.png")).toEqual([
+      "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+      "-i", "/in.png", "-vf", "crop=30:40:1:2", "-frames:v", "1", "-c:v", "png", "/out.png",
+    ])
+  })
+
+  test("cropEngineCandidates：win32 不含 convert", () => {
+    expect(cropEngineCandidates("win32")).toEqual(["magick", "ffmpeg"])
+    expect(cropEngineCandidates("linux")).toEqual(["magick", "convert", "ffmpeg"])
+  })
+})
+
+describe("裁剪执行器探测", () => {
+  test("magick 不可用则续试 convert", async () => {
+    const calls: string[] = []
+    const orig = cropRunner.exec
+    cropRunner.exec = async (file: string) => {
+      calls.push(file)
+      if (file === "magick") throw new Error("ENOENT")
+    }
+    try {
+      expect(await detectCropEngine("linux")).toBe("convert")
+      expect(calls).toEqual(["magick", "convert"])
+    } finally {
+      cropRunner.exec = orig
+    }
+  })
+
+  test("全部不可用返回 undefined", async () => {
+    const orig = cropRunner.exec
+    cropRunner.exec = async () => {
+      throw new Error("ENOENT")
+    }
+    try {
+      expect(await detectCropEngine("linux")).toBeUndefined()
+    } finally {
+      cropRunner.exec = orig
+    }
+  })
+
+  test("win32 不尝试 convert", async () => {
+    const calls: string[] = []
+    const orig = cropRunner.exec
+    cropRunner.exec = async (file: string) => {
+      calls.push(file)
+      throw new Error("ENOENT")
+    }
+    try {
+      expect(await detectCropEngine("win32")).toBeUndefined()
+      expect(calls).toEqual(["magick", "ffmpeg"])
+    } finally {
+      cropRunner.exec = orig
+    }
+  })
+})
+
+test("regionGenericMinText 默认 24", () => {
+  expect(regionGenericMinText.chars).toBe(24)
 })
 

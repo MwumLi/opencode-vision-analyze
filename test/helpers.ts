@@ -6,6 +6,7 @@ import { createHash } from "node:crypto"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import zlib from "node:zlib"
 import type { PluginInput, PluginOptions, ToolContext } from "@opencode-ai/plugin"
 
 /** 1x1 透明 PNG（68 字节），作为测试图片。 */
@@ -201,4 +202,83 @@ export function chatOutput(parts: Array<Record<string, unknown>>) {
 /** chat.message 钩子的 stub 输入。 */
 export function chatInput(input: { sessionID: string; model?: { providerID: string; modelID: string } }) {
   return { sessionID: input.sessionID, agent: "build", model: input.model, messageID: "msg_1" }
+}
+
+// ---- 真实图片字节构造（供尺寸嗅探 / 裁剪流程测试） --------------------------
+
+/** CRC32 查表（PNG 块校验用；避免依赖 zlib.crc32 的 node 版本差异）。 */
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    table[n] = c >>> 0
+  }
+  return table
+})()
+
+function crc32(buf: Buffer): number {
+  let c = 0xffffffff
+  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff]! ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const length = Buffer.alloc(4)
+  length.writeUInt32BE(data.length, 0)
+  const typeBuf = Buffer.from(type, "latin1")
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0)
+  return Buffer.concat([length, typeBuf, data, crc])
+}
+
+/** 构造一张纯色 RGB PNG（真实可被嗅探/解码）。 */
+export function makePng(width: number, height: number, rgb: [number, number, number] = [200, 30, 30]): Buffer {
+  const stride = 1 + width * 3
+  const raw = Buffer.alloc(height * stride)
+  for (let y = 0; y < height; y++) {
+    const row = y * stride
+    raw[row] = 0 // filter: none
+    for (let x = 0; x < width; x++) {
+      const at = row + 1 + x * 3
+      raw[at] = rgb[0]
+      raw[at + 1] = rgb[1]
+      raw[at + 2] = rgb[2]
+    }
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8 // bit depth
+  ihdr[9] = 2 // color type: truecolor
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", zlib.deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ])
+}
+
+/** 构造最小 JPEG（SOI + APP1 Exif Orientation + SOF0 尺寸 + EOI），仅供嗅探测试。 */
+export function makeExifJpeg(width: number, height: number, orientation: number): Buffer {
+  const app1 = Buffer.alloc(2 + 6 + 2 + 2 + 4 + 2 + 12 + 4)
+  app1.writeUInt16BE(app1.length, 0)
+  app1.write("Exif", 2, "latin1")
+  app1.writeUInt16BE(0, 6) // 填充
+  app1.write("MM", 8, "latin1") // TIFF 大端
+  app1.writeUInt16BE(0x2a, 10)
+  app1.writeUInt32BE(8, 12) // IFD0 偏移
+  app1.writeUInt16BE(1, 16) // 条目数
+  app1.writeUInt16BE(0x0112, 18) // Orientation tag
+  app1.writeUInt16BE(3, 20) // SHORT
+  app1.writeUInt32BE(1, 22)
+  app1.writeUInt16BE(orientation, 26)
+  app1.writeUInt32BE(0, 28)
+  const sof = Buffer.alloc(11)
+  sof.writeUInt16BE(0xffc0, 0)
+  sof.writeUInt16BE(11, 2)
+  sof[4] = 8
+  sof.writeUInt16BE(height, 5)
+  sof.writeUInt16BE(width, 7)
+  return Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1]), app1, sof, Buffer.from([0xff, 0xd9])])
 }

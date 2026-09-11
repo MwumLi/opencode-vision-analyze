@@ -34,9 +34,10 @@
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
  */
+import { execFile } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
-import { homedir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import type { FilePart, TextPart } from "@opencode-ai/sdk"
 import type { Hooks, Plugin, PluginInput, PluginOptions, ToolContext, ToolResult } from "@opencode-ai/plugin"
@@ -57,6 +58,255 @@ const MIME_EXT: Record<string, string> = {
   "image/gif": ".gif",
   "image/webp": ".webp",
 }
+
+// ---- 区域裁剪：尺寸嗅探 / 坐标映射 / 命令构造（纯函数，便于单测） ----------------
+
+/** 图片尺寸与显示方向。orientation 为 EXIF Orientation（1 表示无需旋转）。 */
+export type ImageInfo = { width: number; height: number; orientation: number }
+
+/** EXIF Orientation 5–8 表示像素被转置，显示尺寸需交换宽高。 */
+function isTransposed(orientation: number): boolean {
+  return orientation >= 5 && orientation <= 8
+}
+
+/**
+ * 从 JPEG 的 APP1/EXIF 段读 Orientation（tag 0x0112）。
+ * 只做最小 TIFF/IFD 解析；任何不识别都返回 1（按无需旋转处理），绝不猜。
+ */
+export function readExifOrientation(bytes: Buffer): number {
+  // JPEG 以 FFD8 起，逐段扫描 marker；只有 APP1(FFE1) 里才可能有 Exif。
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return 1
+  let offset = 2
+  while (offset + 4 <= bytes.length) {
+    if (bytes[offset] !== 0xff) return 1
+    const marker = bytes[offset + 1]
+    // 0xFF 填充字节；SOI/EOI/RSTn 无长度字段。
+    if (marker === 0xff) {
+      offset += 1
+      continue
+    }
+    if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd9)) {
+      offset += 2
+      continue
+    }
+    const size = bytes.readUInt16BE(offset + 2)
+    if (size < 2) return 1
+    if (marker === 0xe1 && offset + 2 + size <= bytes.length) {
+      const seg = bytes.subarray(offset + 4, offset + 2 + size)
+      if (seg.length > 14 && seg.toString("latin1", 0, 4) === "Exif") {
+        const tiff = seg.subarray(6)
+        const little = tiff.toString("latin1", 0, 2) === "II"
+        const u16 = (at: number) => (little ? tiff.readUInt16LE(at) : tiff.readUInt16BE(at))
+        const u32 = (at: number) => (little ? tiff.readUInt32LE(at) : tiff.readUInt32BE(at))
+        if (tiff.length >= 8 && u16(2) === 0x2a) {
+          const ifd0 = u32(4)
+          if (ifd0 + 2 <= tiff.length) {
+            const count = u16(ifd0)
+            for (let i = 0; i < count; i++) {
+              const entry = ifd0 + 2 + i * 12
+              if (entry + 12 > tiff.length) break
+              if (u16(entry) === 0x0112) {
+                const value = u16(entry + 8)
+                return value >= 1 && value <= 8 ? value : 1
+              }
+            }
+          }
+        }
+      }
+    }
+    // SOS 之后是压缩数据，不可能再有 EXIF。
+    if (marker === 0xda) return 1
+    offset += 2 + size
+  }
+  return 1
+}
+
+/** 读 PNG 宽高（IHDR 固定为签名后第一个块）。 */
+function pngSize(bytes: Buffer): { width: number; height: number } | undefined {
+  if (bytes.length < 24 || bytes.readUInt32BE(0) !== 0x89504e47) return undefined
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
+}
+
+/** 读 GIF 逻辑屏幕宽高（小端 u16）。 */
+function gifSize(bytes: Buffer): { width: number; height: number } | undefined {
+  const sig = bytes.toString("latin1", 0, 6)
+  if (sig !== "GIF87a" && sig !== "GIF89a") return undefined
+  if (bytes.length < 10) return undefined
+  return { width: bytes.readUInt16LE(6), height: bytes.readUInt16LE(8) }
+}
+
+/** 读 JPEG 宽高：扫描到 SOF 段取高/宽（大端 u16）。 */
+function jpegSize(bytes: Buffer): { width: number; height: number } | undefined {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined
+  let offset = 2
+  while (offset + 9 <= bytes.length) {
+    if (bytes[offset] !== 0xff) return undefined
+    const marker = bytes[offset + 1]
+    if (marker === 0xff) {
+      offset += 1
+      continue
+    }
+    if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd9)) {
+      offset += 2
+      continue
+    }
+    const size = bytes.readUInt16BE(offset + 2)
+    if (size < 2) return undefined
+    // SOF0–SOF15 含尺寸；排除 DHT(C4)/JPG(C8)/DAC(CC)。
+    const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+    if (isSof) {
+      return { height: bytes.readUInt16BE(offset + 5), width: bytes.readUInt16BE(offset + 7) }
+    }
+    if (marker === 0xda) return undefined
+    offset += 2 + size
+  }
+  return undefined
+}
+
+/** 读 WebP 宽高（VP8 / VP8L / VP8X 三种子格式）。 */
+function webpSize(bytes: Buffer): { width: number; height: number } | undefined {
+  if (bytes.length < 30 || bytes.toString("latin1", 0, 4) !== "RIFF" || bytes.toString("latin1", 8, 12) !== "WEBP") {
+    return undefined
+  }
+  const format = bytes.toString("latin1", 12, 16)
+  if (format === "VP8X") {
+    return {
+      width: 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)),
+      height: 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)),
+    }
+  }
+  if (format === "VP8L" && bytes.length >= 25 && bytes[20] === 0x2f) {
+    const bits = bytes.readUInt32LE(21)
+    return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >> 14) & 0x3fff) }
+  }
+  if (format === "VP8 ") {
+    // 关键帧起始码 9d 01 2a 之后是 14-bit 宽高（小端）。
+    const start = 20
+    if (bytes.length >= start + 10 && bytes[start + 3] === 0x9d && bytes[start + 4] === 0x01 && bytes[start + 5] === 0x2a) {
+      return {
+        width: bytes.readUInt16LE(start + 6) & 0x3fff,
+        height: bytes.readUInt16LE(start + 8) & 0x3fff,
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * 嗅探图片宽高与显示方向。返回**显示方向**尺寸：EXIF 5–8 时交换宽高，
+ * 与裁剪引擎的 auto-orient 行为对齐。识别失败返回 undefined，绝不猜。
+ */
+export function imageSize(bytes: Buffer): ImageInfo | undefined {
+  const base = pngSize(bytes) ?? gifSize(bytes) ?? jpegSize(bytes) ?? webpSize(bytes)
+  if (!base) return undefined
+  const orientation = readExifOrientation(bytes)
+  const transposed = isTransposed(orientation)
+  return {
+    width: transposed ? base.height : base.width,
+    height: transposed ? base.width : base.height,
+    orientation,
+  }
+}
+
+/** 归一化 region（0–1000 整数坐标，左上原点）。 */
+export type ParsedRegion = { x1: number; y1: number; x2: number; y2: number }
+
+/** 解析并校验 region；容忍浮点（四舍五入），非法返回 undefined。 */
+export function parseRegion(input: unknown): ParsedRegion | undefined {
+  if (!Array.isArray(input) || input.length !== 4) return undefined
+  const nums = input.map((v) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) : NaN))
+  if (nums.some((v) => Number.isNaN(v) || v < 0 || v > 1000)) return undefined
+  const [x1, y1, x2, y2] = nums
+  if (x1 >= x2 || y1 >= y2) return undefined
+  return { x1, y1, x2, y2 }
+}
+
+/** 是否整图（哨兵）——视为"无 region"，走原有整图路径与旧缓存 key。 */
+export function isWholeImageRegion(r: ParsedRegion): boolean {
+  return r.x1 === 0 && r.y1 === 0 && r.x2 === 1000 && r.y2 === 1000
+}
+
+/** region 的缓存 key 片段：用原始归一化值，避免 clamp 后像素随尺寸漂移。 */
+export function regionKey(r: ParsedRegion): string {
+  return `r${r.x1},${r.y1},${r.x2},${r.y2}`
+}
+
+/** 像素矩形（左上原点，宽高）。 */
+export type PixelRect = { left: number; top: number; width: number; height: number }
+
+/**
+ * 归一化 region → 原图像素矩形：左/上向下取整、右/下向上取整，
+ * 保证合法窄区域不塌缩；clamp 到图像边界；零面积返回 undefined。
+ */
+export function regionToPixels(r: ParsedRegion, size: { width: number; height: number }): PixelRect | undefined {
+  const left = Math.max(0, Math.min(Math.floor((r.x1 / 1000) * size.width), size.width))
+  const top = Math.max(0, Math.min(Math.floor((r.y1 / 1000) * size.height), size.height))
+  const right = Math.max(0, Math.min(Math.ceil((r.x2 / 1000) * size.width), size.width))
+  const bottom = Math.max(0, Math.min(Math.ceil((r.y2 / 1000) * size.height), size.height))
+  if (right <= left || bottom <= top) return undefined
+  return { left, top, width: right - left, height: bottom - top }
+}
+
+/** 裁剪引擎类型。 */
+export type CropEngine = "magick" | "convert" | "ffmpeg"
+
+/** 候选引擎顺序：win32 排除 convert（会撞系统 convert.exe）。 */
+export function cropEngineCandidates(platform: string): CropEngine[] {
+  return platform === "win32" ? ["magick", "ffmpeg"] : ["magick", "convert", "ffmpeg"]
+}
+
+/** 构造裁剪命令参数（不经 shell；输出恒 PNG）。 */
+export function buildCropArgs(engine: CropEngine, input: string, rect: PixelRect, output: string): string[] {
+  if (engine === "ffmpeg") {
+    return [
+      "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+      "-i", input, "-vf", `crop=${rect.width}:${rect.height}:${rect.left}:${rect.top}`,
+      "-frames:v", "1", "-c:v", "png", output,
+    ]
+  }
+  // ImageMagick v7/v6：先 auto-orient（与 imageSize 的显示尺寸口径一致）再裁剪；
+  // [0] 取首帧，避免动图多帧输出成 out-0.png 之类。
+  return [`${input}[0]`, "-auto-orient", "-crop", `${rect.width}x${rect.height}+${rect.left}+${rect.top}`, "+repage", output]
+}
+
+/** 裁剪执行超时与并发上限（模块级可变对象，测试可注入小值）。 */
+export const regionCropLimits = { timeoutMs: 15000, maxConcurrent: 2 }
+
+/**
+ * 可注入的进程执行器：生产实现走 child_process.execFile（**不经 shell**，
+ * 参数以数组传入，杜绝注入）；测试注入 fake，不碰真实二进制。
+ * 退出码非 0 / 启动失败 / 超时 / abort 一律 reject。
+ */
+export const cropRunner = {
+  exec: (file: string, args: string[], signal: AbortSignal): Promise<void> =>
+    new Promise((resolve, reject) => {
+      execFile(
+        file,
+        args,
+        { timeout: regionCropLimits.timeoutMs, signal, killSignal: "SIGKILL", windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+        (error) => (error ? reject(error) : resolve()),
+      )
+    }),
+}
+
+/**
+ * 惰性探测可用裁剪引擎：按候选顺序跑一次 `<engine> -version` 验证，首个成功即选中。
+ * 用版本探测而非 which，顺带排除同名但非目标工具的可执行文件。
+ */
+export async function detectCropEngine(platform: string): Promise<CropEngine | undefined> {
+  for (const engine of cropEngineCandidates(platform)) {
+    try {
+      await cropRunner.exec(engine, ["-version"], new AbortController().signal)
+      return engine
+    } catch {
+      // 该候选不可用，续试下一个
+    }
+  }
+  return undefined
+}
+
+/** 有 region 时泛解析条目的最短文本长度（区域描述天然可短，但仍防垃圾）。 */
+export const regionGenericMinText = { chars: 24 }
 
 /**
  * 内部超时错误类型（name = "DeadlineError"）。
