@@ -8,7 +8,7 @@
 
 一个面向 [opencode](https://opencode.ai) 的工具化视觉路由插件：当主模型看不了图片时，由它按需调用 `vision_analyze` 工具——你指定的视觉模型描述图片，描述文字直接回到对话中。当主模型本身支持图片时，贴图原样直发，工具短路返回原图。
 
-**零运行时依赖。** 只用 node 内置模块（`crypto`/`fs`/`path`）和纯类型导入——除插件本身外无需安装任何东西。
+**零运行时依赖。** 只用 node 内置模块（`crypto`/`fs`/`path`/`os`/`child_process`）和纯类型导入——除插件本身外无需安装任何东西。
 
 ## 特性
 
@@ -16,6 +16,7 @@
 - **描述针对问题。** 模型把自己关注的问题传给 `vision_analyze`——而不是提交时预生成的一次性通用描述。若只是让描述整张图，模型留空 `question`，工具用固定文案兜底，使同一张图的泛描述共享一条缓存（见"内容寻址缓存"）。
 - **原生快速路径。** 主模型本身有视觉能力时，`vision_analyze` 完全跳过视觉模型，直接把原图作为工具附件返回。
 - **内容寻址缓存。** 图片与描述按内容哈希落到用户级共享目录，跨会话 / 项目 / 重启复用——同一张图不会重复付费描述；同一张图的所有泛解析请求都收敛到同一条缓存。存储路径、容量上限与固定文案详见下文「存储与缓存」。
+- **区域裁剪（放大看细节）。** 大图里的细小文字/密集 UI 会被模型内部降采样压糊。主模型可先看整图，再带一个 `region`（归一化 0–1000 坐标）调 `vision_analyze`，插件把该区域**先裁出来再降采样**，小块独享完整分辨率预算——等效放大。裁剪走外挂命令（ImageMagick / ffmpeg，运行时探测），**不引入任何运行时依赖**；未安装时返回清晰错误，整图功能不受影响。
 - **统一鉴权。** 视觉调用走 opencode 子会话，复用 opencode 已管理的 provider 凭据，无需额外配置 API Key。
 
 ## 安装
@@ -66,6 +67,7 @@ curl 方式说明：
 | `unlisted_fallback` | 否 | `false` | 显式 `models` 链耗尽后，自动续试未列入清单的 image-capable 模型。 |
 | `free_first` | 否 | `false` | 自动发现时优先匿名/内置免费（`custom` 源）provider，置于 config 源之前——反转 source 档序。 |
 | `timeout_ms` | 否 | `60000` | 子会话内每次 create/prompt 请求各自的超时预算（毫秒） |
+| `crop_command` | 否 | — | 区域裁剪使用的可执行文件（如 `/usr/bin/ffmpeg`）；缺省时按 `magick` → `convert` → `ffmpeg` 顺序自动探测。参数模板按文件名推断（含 `ffmpeg` 用 ffmpeg 语法，否则按 ImageMagick）。 |
 
 受支持的图片扩展名：png / jpg / jpeg / gif / webp。
 
@@ -105,10 +107,10 @@ curl 方式说明：
 
 **描述缓存（`descriptions/`）**
 
-- **key**：`<图片sha256>:<生效问题>`，文件名取 `sha256(key)`。
+- **key**：无 `region` 时为 `<图片sha256>:<生效问题>`，文件名取 `sha256(key)`（与旧版逐字节一致，存量条目照常命中）；带 `region` 时为 `<图片sha256>:r<x1>,<y1>,<x2>,<y2>|<生效问题>`（用原始归一化坐标，与整图条目隔离）。
 - **泛解析（`question` 空 / 省略）**：归一化到固定文案 `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`，所有泛解析收敛到同一条。
 - **具体追问**：保留原问句，走各自的 `<图片sha256>:<问题>` key（格式与旧版一致，存量条目照常命中）。
-- **写入门槛**：泛解析条目要求描述 ≥ 100 字符，防止视觉模型敷衍/拒答的短文本毒化共享条目。
+- **写入门槛**：泛解析条目要求描述 ≥ 100 字符（带 `region` 时为 ≥ 24 字符——区域描述天然可短），防止视觉模型敷衍/拒答的短文本毒化共享条目。
 - **淘汰**：按文件 mtime LRU，上限 2000 条 / 50MB；**并发安全**同上。
 
 **平台默认缓存根**
@@ -136,23 +138,28 @@ curl 方式说明：
 
 主模型处理：
  ├─ 有视觉：直接看原图（零成本）
- └─ 无视觉：看到提示，调用 vision_analyze(image_path, question)
+ └─ 无视觉：看到提示，调用 vision_analyze(image_path, question[, region])
 
 vision_analyze 工具：
  ├─ 原生快速路径：会话主模型有视觉能力
  │    → 原图作为附件直接返回（不调视觉模型）
  ├─ http(s) 图片 URL → 下载（20 MB 上限）→ 统一磁盘路径
- ├─ 描述缓存命中（图片哈希 + 生效问题）→ 直接返回缓存文本
- │    （泛解析收敛到 <sha>:<固定整图描述文案>；
+ ├─ 有 region（归一化 0–1000 的 [x1,y1,x2,y2]）：
+ │    → 按坐标从原图裁出子区域（**先裁后降采样**，小块独享完整分辨率）
+ │    → 快速路径回裁剪图；描述路径子会话发 [裁剪图, 原图]（原图作全局上下文）
+ │    → 结果附裁剪区像素边界 + 坐标回映说明，坐标恒相对原图、可迭代裁剪
+ ├─ 描述缓存命中（图片哈希 + region + 生效问题）→ 直接返回缓存文本
+ │    （泛解析收敛到 <sha>[:region]:<固定整图描述文案>；
  │      持久化于 <cache>/opencode-vision-analyze/descriptions，
  │      标签沿用产出该描述的模型）
  └─ 候选链：沿链逐候选建子会话（parentID 挂当前会话、禁用全部工具、
-     专用 system prompt，图片 + 问题发给该候选视觉模型）
+      专用 system prompt，图片 + 问题发给该候选视觉模型）
      → 首个成功即返回 → 子会话删除
 ```
 
 关键行为：
 
+- **区域裁剪** —— `vision_analyze` 的 `region` 为可选参数；省略或传整图哨兵 `[0,0,1000,1000]` 即整图（与旧行为、旧缓存 key 完全一致）。裁剪走外挂命令 `magick`/`convert`/`ffmpeg`（运行时探测，win32 不试 `convert` 以免撞系统同名工具），未探测到引擎时返回清晰错误而非报错。裁剪在**降采样之前**执行，故放大有效。EXIF 方向自动对齐（JPEG：嗅探 orientation 并在引擎侧 auto-orient）；原图过大（>8 MB）时只发裁剪图、不带整图上下文。
 - **能力门控** —— 查询 `config.providers()` 能力字段，进程级缓存；有视觉能力的主模型永远不会收到提示或被路由。
 - **候选链** —— `models` 列表按序逐个尝试直到成功。显式模型恒在链首；无显式配置（或 `models` 为空数组）时自动发现全部 image-capable 模型，按 provider 来源排序（config 最前 → env/api → custom/匿名；`free_first: true` 时反转）。`unlisted_fallback: true` 时显式链耗尽后会续试未列出的 image-capable 模型。
 - **递归防护（整链）** —— 候选链子会话发起的消息不会被再次处理。
@@ -162,9 +169,12 @@ vision_analyze 工具：
 - **URL 图片** —— `image_path` 接受 `http(s)://...` 地址（需以受支持的图片扩展名结尾：png/jpg/jpeg/gif/webp）。
 - **泛解析共享同一条缓存** —— 空 / 省略的 `question` 视为整图描述，复用该图已缓存的描述；具体追问各自保留条目（细节见「存储与缓存」）。
 
-## Roadmap
+## 已知限制
 
-- [ ] 区域裁剪（放大查看图片细节）
+- **区域裁剪需自备外部工具**：需安装 ImageMagick（`magick`/`convert`）或 `ffmpeg`；都没有时 `region` 不可用（返回清晰错误），整图解析不受影响。
+- **EXIF 自动对齐针对 JPEG**：插件嗅探 JPEG 的 orientation 并在引擎侧 auto-orient。`ffmpeg` 的自动旋转依赖其构建/版本（较新版本默认开启）；若旋转过的 JPEG 出现裁错区，请改用 ImageMagick，或先把图转正再分析。
+- **坐标为估计值**：主模型看不见图，`region` 是它估的；可能裁偏。错误信息会带上真实图像尺寸，可据此迭代重试。
+- **大图上下文省略**：原图超过 8 MB 时，`region` 请求只发裁剪图、不带整图上下文。
 
 ## 开发
 
@@ -205,3 +215,15 @@ npm version patch                      # 去掉 pre 段并升到正式版本
 ## 许可证
 
 [MIT](./LICENSE)
+
+## 区域裁剪工具
+
+区域裁剪通过**子进程调用**以下外部工具（不打包、不链接，均为可选；未安装时 `region` 不可用，整图功能不受影响）：
+
+| 工具 | 用途 | GitHub | 主页 |
+|---|---|---|---|
+| ImageMagick（`magick` / `convert`） | 区域裁剪（首选） | https://github.com/ImageMagick/ImageMagick | https://imagemagick.org |
+| FFmpeg（`ffmpeg`） | 区域裁剪（备选） | https://github.com/FFmpeg/FFmpeg | https://ffmpeg.org |
+| GraphicsMagick（`gm`，可经 `crop_command` 指定） | 区域裁剪（兼容 ImageMagick 参数） | https://github.com/GraphicsMagick/GraphicsMagick | http://www.graphicsmagick.org |
+
+探测结果只缓存"成功"：首次探测失败时下次触发会重新探测（装好工具后无需重启 opencode）；若已缓存成功后又安装了别的工具，需退出并重进 opencode 让首次探测重跑。

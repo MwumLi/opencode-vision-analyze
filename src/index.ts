@@ -27,16 +27,25 @@
  * 主模型本身支持图片输入时走快速路径：不做子会话描述，直接把原图作为
  * 工具附件回传给模型自行查看。
  *
- * 说明：本插件只用 node 内置模块（crypto/fs/path），无任何运行时外部依赖，
+ * 区域裁剪：vision_analyze 支持可选 region（归一化 0–1000 的 [x1,y1,x2,y2]）。
+ * 主模型先看整图，若某处细节看不清（小字/密集 UI），再带 region 调一次放大。
+ * 插件按 region 从原图裁出子区域（**先裁后降采样**，小块独享完整分辨率预算），
+ * 有 region 时子会话发 [裁剪图, 原图] 两张（原图作全局上下文）。裁剪走**外挂命令**
+ * （magick/convert/ffmpeg，运行时探测、缺失则报可读错误），保持零运行时依赖；
+ * 坐标相对原图、恒可迭代，无 region 行为与缓存 key 完全不变。
+ * 另注册 tool.definition 钩子：框架会把非 zod 参数全标 required，这里改回仅 image_path。
+ *
+ * 说明：本插件只用 node 内置模块（crypto/fs/path/os/child_process），无任何运行时外部依赖，
  * 类型依赖仅 @opencode-ai/plugin 与 @opencode-ai/sdk 的 type import。
  *
  * 已知限制：
  * - 仅 V1 会话流有效：chat.message 钩子挂在 V1 SessionPrompt 路径上；
  *   若交互默认切到 V2 Session 核心，本钩子不会触发（也不会报错）。
  */
+import { execFile } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
-import { homedir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import type { FilePart, TextPart } from "@opencode-ai/sdk"
 import type { Hooks, Plugin, PluginInput, PluginOptions, ToolContext, ToolResult } from "@opencode-ai/plugin"
@@ -57,6 +66,274 @@ const MIME_EXT: Record<string, string> = {
   "image/gif": ".gif",
   "image/webp": ".webp",
 }
+
+// ---- 区域裁剪：尺寸嗅探 / 坐标映射 / 命令构造（纯函数，便于单测） ----------------
+
+/** 图片尺寸与显示方向。orientation 为 EXIF Orientation（1 表示无需旋转）。 */
+export type ImageInfo = { width: number; height: number; orientation: number }
+
+/** EXIF Orientation 5–8 表示像素被转置，显示尺寸需交换宽高。 */
+function isTransposed(orientation: number): boolean {
+  return orientation >= 5 && orientation <= 8
+}
+
+/**
+ * 从 JPEG 的 APP1/EXIF 段读 Orientation（tag 0x0112）。
+ * 只做最小 TIFF/IFD 解析；任何不识别都返回 1（按无需旋转处理），绝不猜。
+ */
+export function readExifOrientation(bytes: Buffer): number {
+  // JPEG 以 FFD8 起，逐段扫描 marker；只有 APP1(FFE1) 里才可能有 Exif。
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return 1
+  let offset = 2
+  while (offset + 4 <= bytes.length) {
+    if (bytes[offset] !== 0xff) return 1
+    const marker = bytes[offset + 1]
+    // 0xFF 填充字节；SOI/EOI/RSTn 无长度字段。
+    if (marker === 0xff) {
+      offset += 1
+      continue
+    }
+    if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd9)) {
+      offset += 2
+      continue
+    }
+    const size = bytes.readUInt16BE(offset + 2)
+    if (size < 2) return 1
+    if (marker === 0xe1 && offset + 2 + size <= bytes.length) {
+      const seg = bytes.subarray(offset + 4, offset + 2 + size)
+      if (seg.length > 14 && seg.toString("latin1", 0, 4) === "Exif") {
+        const tiff = seg.subarray(6)
+        const little = tiff.toString("latin1", 0, 2) === "II"
+        const u16 = (at: number) => (little ? tiff.readUInt16LE(at) : tiff.readUInt16BE(at))
+        const u32 = (at: number) => (little ? tiff.readUInt32LE(at) : tiff.readUInt32BE(at))
+        if (tiff.length >= 8 && u16(2) === 0x2a) {
+          const ifd0 = u32(4)
+          if (ifd0 + 2 <= tiff.length) {
+            const count = u16(ifd0)
+            for (let i = 0; i < count; i++) {
+              const entry = ifd0 + 2 + i * 12
+              if (entry + 12 > tiff.length) break
+              if (u16(entry) === 0x0112) {
+                const value = u16(entry + 8)
+                return value >= 1 && value <= 8 ? value : 1
+              }
+            }
+          }
+        }
+      }
+    }
+    // SOS 之后是压缩数据，不可能再有 EXIF。
+    if (marker === 0xda) return 1
+    offset += 2 + size
+  }
+  return 1
+}
+
+/** 读 PNG 宽高（IHDR 固定为签名后第一个块）。 */
+function pngSize(bytes: Buffer): { width: number; height: number } | undefined {
+  if (bytes.length < 24 || bytes.readUInt32BE(0) !== 0x89504e47) return undefined
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
+}
+
+/** 读 GIF 逻辑屏幕宽高（小端 u16）。 */
+function gifSize(bytes: Buffer): { width: number; height: number } | undefined {
+  const sig = bytes.toString("latin1", 0, 6)
+  if (sig !== "GIF87a" && sig !== "GIF89a") return undefined
+  if (bytes.length < 10) return undefined
+  return { width: bytes.readUInt16LE(6), height: bytes.readUInt16LE(8) }
+}
+
+/** 读 JPEG 宽高：扫描到 SOF 段取高/宽（大端 u16）。 */
+function jpegSize(bytes: Buffer): { width: number; height: number } | undefined {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined
+  let offset = 2
+  while (offset + 9 <= bytes.length) {
+    if (bytes[offset] !== 0xff) return undefined
+    const marker = bytes[offset + 1]
+    if (marker === 0xff) {
+      offset += 1
+      continue
+    }
+    if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd9)) {
+      offset += 2
+      continue
+    }
+    const size = bytes.readUInt16BE(offset + 2)
+    if (size < 2) return undefined
+    // SOF0–SOF15 含尺寸；排除 DHT(C4)/JPG(C8)/DAC(CC)。
+    const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+    if (isSof) {
+      return { height: bytes.readUInt16BE(offset + 5), width: bytes.readUInt16BE(offset + 7) }
+    }
+    if (marker === 0xda) return undefined
+    offset += 2 + size
+  }
+  return undefined
+}
+
+/** 读 WebP 宽高（VP8 / VP8L / VP8X 三种子格式）。 */
+function webpSize(bytes: Buffer): { width: number; height: number } | undefined {
+  if (bytes.length < 16 || bytes.toString("latin1", 0, 4) !== "RIFF" || bytes.toString("latin1", 8, 12) !== "WEBP") {
+    return undefined
+  }
+  const format = bytes.toString("latin1", 12, 16)
+  if (format === "VP8X") {
+    if (bytes.length < 30) return undefined
+    return {
+      width: 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)),
+      height: 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)),
+    }
+  }
+  if (format === "VP8L") {
+    // 最小 VP8L 头到 bits 字段共 25 字节，故按子格式单独判长度，别用统一的 30。
+    if (bytes.length < 25 || bytes[20] !== 0x2f) return undefined
+    const bits = bytes.readUInt32LE(21)
+    return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >> 14) & 0x3fff) }
+  }
+  if (format === "VP8 ") {
+    if (bytes.length < 30) return undefined
+    // 关键帧起始码 9d 01 2a 之后是 14-bit 宽高（小端）。
+    const start = 20
+    if (bytes[start + 3] === 0x9d && bytes[start + 4] === 0x01 && bytes[start + 5] === 0x2a) {
+      return {
+        width: bytes.readUInt16LE(start + 6) & 0x3fff,
+        height: bytes.readUInt16LE(start + 8) & 0x3fff,
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * 嗅探图片宽高与显示方向。返回**显示方向**尺寸：EXIF 5–8 时交换宽高，
+ * 与裁剪引擎的 auto-orient 行为对齐。识别失败返回 undefined，绝不猜。
+ */
+export function imageSize(bytes: Buffer): ImageInfo | undefined {
+  const base = pngSize(bytes) ?? gifSize(bytes) ?? jpegSize(bytes) ?? webpSize(bytes)
+  if (!base) return undefined
+  const orientation = readExifOrientation(bytes)
+  const transposed = isTransposed(orientation)
+  return {
+    width: transposed ? base.height : base.width,
+    height: transposed ? base.width : base.height,
+    orientation,
+  }
+}
+
+/** 归一化 region（0–1000 整数坐标，左上原点）。 */
+export type ParsedRegion = { x1: number; y1: number; x2: number; y2: number }
+
+/** 解析并校验 region；容忍浮点（四舍五入），非法返回 undefined。 */
+export function parseRegion(input: unknown): ParsedRegion | undefined {
+  if (!Array.isArray(input) || input.length !== 4) return undefined
+  const nums = input.map((v) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) : NaN))
+  if (nums.some((v) => Number.isNaN(v) || v < 0 || v > 1000)) return undefined
+  const [x1, y1, x2, y2] = nums
+  if (x1 >= x2 || y1 >= y2) return undefined
+  return { x1, y1, x2, y2 }
+}
+
+/** 是否整图（哨兵）——视为"无 region"，走原有整图路径与旧缓存 key。 */
+export function isWholeImageRegion(r: ParsedRegion): boolean {
+  return r.x1 === 0 && r.y1 === 0 && r.x2 === 1000 && r.y2 === 1000
+}
+
+/** region 的缓存 key 片段：用原始归一化值，避免 clamp 后像素随尺寸漂移。 */
+export function regionKey(r: ParsedRegion): string {
+  return `r${r.x1},${r.y1},${r.x2},${r.y2}`
+}
+
+/** 像素矩形（左上原点，宽高）。 */
+export type PixelRect = { left: number; top: number; width: number; height: number }
+
+/**
+ * 归一化 region → 原图像素矩形：左/上向下取整、右/下向上取整，
+ * 保证合法窄区域不塌缩；clamp 到图像边界；零面积返回 undefined。
+ */
+export function regionToPixels(r: ParsedRegion, size: { width: number; height: number }): PixelRect | undefined {
+  const left = Math.max(0, Math.min(Math.floor((r.x1 / 1000) * size.width), size.width))
+  const top = Math.max(0, Math.min(Math.floor((r.y1 / 1000) * size.height), size.height))
+  const right = Math.max(0, Math.min(Math.ceil((r.x2 / 1000) * size.width), size.width))
+  const bottom = Math.max(0, Math.min(Math.ceil((r.y2 / 1000) * size.height), size.height))
+  if (right <= left || bottom <= top) return undefined
+  return { left, top, width: right - left, height: bottom - top }
+}
+
+/** 裁剪引擎类型。 */
+export type CropEngine = "magick" | "convert" | "ffmpeg"
+
+/** 候选引擎顺序：win32 排除 convert（会撞系统 convert.exe）。 */
+export function cropEngineCandidates(platform: string): CropEngine[] {
+  return platform === "win32" ? ["magick", "ffmpeg"] : ["magick", "convert", "ffmpeg"]
+}
+
+/** 由可执行文件名（或路径）推断参数模板：含 ffmpeg 用 ffmpeg 语法，否则按 ImageMagick。 */
+export function engineForCommand(cmd: string): CropEngine {
+  const base = path.basename(cmd).toLowerCase()
+  if (base.includes("ffmpeg")) return "ffmpeg"
+  if (base.includes("convert")) return "convert"
+  return "magick"
+}
+
+/** 构造裁剪命令参数（不经 shell；输出恒 PNG）。 */
+export function buildCropArgs(engine: CropEngine, input: string, rect: PixelRect, output: string): string[] {
+  if (engine === "ffmpeg") {
+    return [
+      "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+      "-i", input, "-vf", `crop=${rect.width}:${rect.height}:${rect.left}:${rect.top}`,
+      "-frames:v", "1", "-c:v", "png", output,
+    ]
+  }
+  // ImageMagick v7/v6：先 auto-orient（与 imageSize 的显示尺寸口径一致）再裁剪；
+  // [0] 取首帧，避免动图多帧输出成 out-0.png 之类。
+  return [`${input}[0]`, "-auto-orient", "-crop", `${rect.width}x${rect.height}+${rect.left}+${rect.top}`, "+repage", output]
+}
+
+/** 裁剪执行超时与并发上限（模块级可变对象，测试可注入小值）。 */
+export const regionCropLimits = { timeoutMs: 15000, maxConcurrent: 2 }
+
+/**
+ * 可注入的进程执行器：生产实现走 child_process.execFile（**不经 shell**，
+ * 参数以数组传入，杜绝注入）；测试注入 fake，不碰真实二进制。
+ * 退出码非 0 / 启动失败 / 超时 / abort 一律 reject。
+ */
+export const cropRunner = {
+  exec: (file: string, args: string[], signal: AbortSignal): Promise<void> =>
+    new Promise((resolve, reject) => {
+      execFile(
+        file,
+        args,
+        { timeout: regionCropLimits.timeoutMs, signal, killSignal: "SIGKILL", windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+        (error) => (error ? reject(error) : resolve()),
+      )
+    }),
+}
+
+/**
+ * 惰性探测可用裁剪引擎：按候选顺序跑一次 `<engine> -version` 验证，首个成功即选中。
+ * 用版本探测而非 which，顺带排除同名但非目标工具的可执行文件。
+ */
+export async function detectCropEngine(platform: string): Promise<CropEngine | undefined> {
+  for (const engine of cropEngineCandidates(platform)) {
+    try {
+      await cropRunner.exec(engine, ["-version"], new AbortController().signal)
+      return engine
+    } catch {
+      // 该候选不可用，续试下一个
+    }
+  }
+  return undefined
+}
+
+/** 有 region 时泛解析条目的最短文本长度（区域描述天然可短，但仍防垃圾）。 */
+export const regionGenericMinText = { chars: 24 }
+
+/**
+ * 有 region 时，作为全局上下文随裁剪图一起发送的原图字节上限（默认 8 MB）。
+ * 原图过大就只发裁剪图——避免为了上下文反而把请求顶到 provider 上限。
+ * 模块级可变对象，测试可注入小值。
+ */
+export const regionContextLimits = { maxBytes: 8 * 1024 * 1024 }
 
 /**
  * 内部超时错误类型（name = "DeadlineError"）。
@@ -253,6 +530,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   const fallbackUnlisted = optionsArg?.unlisted_fallback === true
   const freeFirst = optionsArg?.free_first === true
 
+  // crop_command：显式指定裁剪可执行文件（跳过自动探测）。非空字符串才生效；
+  // 参数模板按可执行文件 basename 推断（含 "ffmpeg" 用 ffmpeg 语法，否则按 ImageMagick）。
+  const cropCommandOption = optionsArg?.crop_command
+  const cropCommand =
+    typeof cropCommandOption === "string" && cropCommandOption.trim() ? cropCommandOption.trim() : undefined
+
   // 子会话请求的超时时间：timeout_ms 为正数时生效，默认 60 秒。
   const timeoutOption = optionsArg?.timeout_ms
   const timeoutMs =
@@ -329,11 +612,16 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    */
   const attemptModel = async (
     candidate: { providerID: string; modelID: string },
-    image: { bytes: Buffer; mime: string },
+    images: Array<{ bytes: Buffer; mime: string }>,
     question: string,
     ctx: ToolContext,
   ): Promise<{ ok: true; text: string } | { ok: false; error: string; aborted?: boolean }> => {
-    const dataURL = `data:${image.mime};base64,${image.bytes.toString("base64")}`
+    // 多图按序拼进 parts：有 region 时是 [裁剪图, 原图]，无 region 时只有原图。
+    const fileParts = images.map((image) => ({
+      type: "file" as const,
+      mime: image.mime,
+      url: `data:${image.mime};base64,${image.bytes.toString("base64")}`,
+    }))
     let subID: string | undefined
     // "回合可能仍在飞"标记：请求被本地 deadline（超时）或用户 abort 掐断时置位，
     // finally 据此先 abort 子会话（取消 provider 端孤儿回合）再 delete。
@@ -358,10 +646,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
             // vision_analyze 形成递归，也避免任何副作用。
             tools: { "*": false },
             system: VISION_SYSTEM_PROMPT,
-            parts: [
-              { type: "file", mime: image.mime, url: dataURL },
-              { type: "text", text: question },
-            ],
+            parts: [...fileParts, { type: "text", text: question }],
           },
         }),
         ctx,
@@ -400,7 +685,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * 全部失败聚合各候选原因；空链返回友好错误。本函数永不抛错。
    */
   const describeWithChain = async (
-    image: { bytes: Buffer; mime: string },
+    images: Array<{ bytes: Buffer; mime: string }>,
     question: string,
     ctx: ToolContext,
   ): Promise<{ ok: true; text: string; modelId: string } | { ok: false; error: string }> => {
@@ -409,7 +694,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     const chain = await resolveChain()
     const failures: string[] = []
     for (const candidate of chain) {
-      const attempt = await attemptModel(candidate, image, question, ctx)
+      const attempt = await attemptModel(candidate, images, question, ctx)
       if (attempt.ok) return { ok: true, text: attempt.text, modelId: modelRefKey(candidate) }
       if (attempt.aborted) return { ok: false, error: attempt.error } // abort 中止整链
       failures.push(`${modelRefKey(candidate)}: ${attempt.error}`)
@@ -533,6 +818,79 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     }
   }
 
+  // ---- 区域裁剪（外挂命令；闭包内缓存探测结果） --------------------------------
+  /** 解析出的裁剪工具：file 为实际执行的可执行文件，engine 决定参数模板。 */
+  type ResolvedCrop = { file: string; engine: CropEngine }
+  // 只缓存"探测成功"的结果：成功后不再探测；失败不落缓存，下次触发再探，
+  // 这样用户装了工具后无需重启 opencode 即可用。若已成功缓存后又装了别的工具，
+  // 仍用已缓存的那个，需重启让首次探测重跑（这是刻意取舍）。
+  let cropEngineCache: ResolvedCrop | undefined
+  // 合并并发探测：多个 region 请求同时触发时共享同一次探测，避免重复起进程。
+  let cropProbe: Promise<CropEngine | undefined> | undefined
+  const resolveCropEngine = async (): Promise<ResolvedCrop | undefined> => {
+    if (cropEngineCache) return cropEngineCache
+    // 显式 crop_command 优先：跳过探测，模板按文件名推断。
+    if (cropCommand) {
+      cropEngineCache = { file: cropCommand, engine: engineForCommand(cropCommand) }
+      return cropEngineCache
+    }
+    cropProbe ??= detectCropEngine(process.platform)
+    const engine = await cropProbe
+    cropProbe = undefined
+    if (engine) cropEngineCache = { file: engine, engine }
+    return cropEngineCache
+  }
+
+  // 简易并发信号量：限制同时运行的裁剪子进程数，避免批量裁剪打满 CPU 饿死事件循环。
+  // 释放时把名额**直接移交**给下一个等待者（等待者不再自增），避免"先减后加"的瞬时超限。
+  let activeCrops = 0
+  const cropWaiters: Array<() => void> = []
+  const acquireCropSlot = async (): Promise<void> => {
+    if (activeCrops < regionCropLimits.maxConcurrent) {
+      activeCrops += 1
+      return
+    }
+    // 被 releaseCropSlot 唤醒时名额已移交，无需再自增。
+    await new Promise<void>((resolve) => cropWaiters.push(resolve))
+  }
+  const releaseCropSlot = (): void => {
+    const next = cropWaiters.shift()
+    if (next) next()
+    else activeCrops -= 1
+  }
+
+  /**
+   * 按 region 裁剪图片，返回裁剪后的 PNG 字节（临时文件即用即删）。
+   * 任何失败（无引擎 / 命令失败 / 超时 / 读取失败）都返回 { error }，不抛错。
+   */
+  const cropImage = async (
+    inputPath: string,
+    rect: PixelRect,
+    ctx: ToolContext,
+  ): Promise<{ bytes: Buffer; mime: string } | { error: string }> => {
+    const engine = await resolveCropEngine()
+    if (!engine) {
+      return {
+        error: "region cropping requires ImageMagick (magick/convert) or ffmpeg; install one or omit region",
+      }
+    }
+    await acquireCropSlot()
+    let tmpDir: string | undefined
+    try {
+      tmpDir = await fs.mkdtemp(path.join(tmpdir(), "vision-crop-"))
+      const out = path.join(tmpDir, `crop-${randomUUID()}.png`)
+      await cropRunner.exec(engine.file, buildCropArgs(engine.engine, inputPath, rect, out), ctx.abort)
+      const bytes = await fs.readFile(out)
+      if (bytes.length === 0) return { error: "region crop produced an empty image" }
+      return { bytes, mime: "image/png" }
+    } catch (error) {
+      return { error: `region crop failed: ${errText(error)}` }
+    } finally {
+      releaseCropSlot()
+      if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
   // ---- 描述缓存（用户级目录落盘，磁盘即事实；全链 fail-open） ---------------------
   /** 描述缓存 key → 磁盘文件路径（<dir>/<sha256(key)>.json）。 */
   const descCacheFile = (key: string): string =>
@@ -635,7 +993,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * 自行决定下一步（重试、换问题或告知用户）。
    */
   const visionAnalyze = async (
-    args: { image_path: string; question?: string },
+    args: { image_path: string; question?: string; region?: unknown },
     ctx: ToolContext,
   ): Promise<ToolResult> => {
     const title = "vision_analyze"
@@ -661,10 +1019,57 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         return { title, output: `Image not found or unsupported: ${args.image_path}` }
       }
 
-      // 快速路径：主模型本身具备视觉能力时，不再走子会话描述，直接把原图
-      // 作为附件回传给模型自行查看（省一次往返，模型看到的是原图而非转述）。
+      // region 解析（纯计算，不调外部命令）：非法直接报错；整图哨兵视为无 region。
+      // 尺寸/映射只在这里算一次，后续快速路径、缓存 key、裁剪都复用。
+      let regionRect: PixelRect | undefined
+      let regionTag = ""
+      let regionDims = ""
+      if (args.region !== undefined) {
+        const parsed = parseRegion(args.region)
+        if (!parsed) {
+          return {
+            title,
+            output:
+              "Image analysis failed: invalid region; expected [x1,y1,x2,y2] as four integers in 0-1000 (normalized, top-left origin)",
+          }
+        }
+        if (!isWholeImageRegion(parsed)) {
+          const info = imageSize(image.bytes)
+          if (!info) {
+            return { title, output: "Image analysis failed: cannot determine image dimensions for region crop" }
+          }
+          const rect = regionToPixels(parsed, info)
+          if (!rect) {
+            return {
+              title,
+              output: `Image analysis failed: invalid region crops to zero area; image is ${info.width}x${info.height} px`,
+            }
+          }
+          regionRect = rect
+          regionTag = regionKey(parsed)
+          regionDims = `${info.width}x${info.height}`
+        }
+      }
+
+      // 快速路径：主模型本身具备视觉能力时，不再走子会话描述，直接把图作为附件
+      // 回传。有 region 时回裁剪图（同样先裁再发，主模型看到的是放大后的细节）。
       const current = sessionModels.get(ctx.sessionID)
       if (current && (await imageSupport(current.providerID, current.modelID))) {
+        if (regionRect) {
+          const cropped = await cropImage(imagePath, regionRect, ctx)
+          if ("error" in cropped) return { title, output: `Image analysis failed: ${cropped.error}` }
+          return {
+            title,
+            output: `[Image attached for direct inspection: ${path.basename(imagePath)} (region ${regionTag})]`,
+            attachments: [
+              {
+                type: "file",
+                mime: cropped.mime,
+                url: `data:${cropped.mime};base64,${cropped.bytes.toString("base64")}`,
+              },
+            ],
+          }
+        }
         return {
           title,
           output: `[Image attached for direct inspection: ${path.basename(imagePath)}]`,
@@ -678,28 +1083,49 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         }
       }
 
+      // 有 region 时附坐标披露：裁剪区在原图的像素边界，以及"视觉模型报的坐标相对裁剪原点"，
+      // 便于主模型把区域坐标映射回原图、继续迭代裁剪。命中缓存也要带，故提前算好。
+      const disclosure = regionRect
+        ? `\n\n[Region: cropped [x=${regionRect.left}, y=${regionRect.top}, w=${regionRect.width}, h=${regionRect.height}] from the original image (${regionDims}); any coordinates the vision model reports are relative to this crop origin.]`
+        : ""
+
       // 描述缓存：内容哈希 + 生效问题作为 key，命中直接复用（title 标注 cached）。
-      // 落盘在用户级共享目录（resolveDescriptionDir）——跨项目/进程/重启命中；磁盘即事实。
-      const key = `${createHash("sha256").update(image.bytes).digest("hex")}:${question}`
+      // 有 region 时在 key 里带上原始归一化区域，与整图条目隔离；无 region 保持旧格式，
+      // 存量条目照常命中。落盘在用户级共享目录——跨项目/进程/重启命中；磁盘即事实。
+      const sha = createHash("sha256").update(image.bytes).digest("hex")
+      const key = regionTag ? `${sha}:${regionTag}|${question}` : `${sha}:${question}`
       const cached = await descCacheGet(key)
       if (cached !== undefined) {
         // 命中时标签沿用入库时的模型（cached.modelId）：即便此刻候选链链首
         // 已与入库模型不同，也保持标签真实、不重写。
-        return { title: `${title} (cached)`, output: format(path.basename(imagePath), cached.modelId, cached.text) }
+        return {
+          title: `${title} (cached)`,
+          output: format(path.basename(imagePath), cached.modelId, cached.text) + disclosure,
+        }
       }
 
-      const result = await describeWithChain(image, question, ctx)
+      // miss：有 region 才裁剪（命中缓存时不白跑外部命令）。裁剪图在前、原图作上下文，
+      // 因为视觉子会话是全新会话，看不到之前的整图描述；原图过大则只发裁剪图，
+      // 避免为了上下文反而把请求顶到 provider 上限。
+      let images: Array<{ bytes: Buffer; mime: string }> = [image]
+      if (regionRect) {
+        const cropped = await cropImage(imagePath, regionRect, ctx)
+        if ("error" in cropped) return { title, output: `Image analysis failed: ${cropped.error}` }
+        images = image.bytes.length <= regionContextLimits.maxBytes ? [cropped, image] : [cropped]
+      }
+      const result = await describeWithChain(images, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
       // 泛解析条目是全图共享的：文本太短多半是视觉模型敷衍/拒答，存进去会毒化这条
-      // canonical 缓存，让以后所有泛解析都命中垃圾描述，所以低于门槛就跳过落盘。
+      // canonical 缓存。有 region 时用更小的下限——区域描述天然可短，但仍防短垃圾。
       // 具体追问不受限（"答案是 42" 是合法短答案）。
-      if (generic && result.text.length < genericWriteMinText.chars) {
-        return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
+      const minChars = regionRect ? regionGenericMinText.chars : genericWriteMinText.chars
+      if (generic && result.text.length < minChars) {
+        return { title, output: format(path.basename(imagePath), result.modelId, result.text) + disclosure }
       }
       // 入库带上实际产出描述的候选 modelId，供后续缓存命中还原真实标签
       await descCacheSet(key, { modelId: result.modelId, text: result.text })
       // 成功标签直接用实际产出描述的候选引用键（而非链首近似）
-      return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
+      return { title, output: format(path.basename(imagePath), result.modelId, result.text) + disclosure }
     } catch (error) {
       return { title, output: `Image analysis failed: ${errText(error)}` }
     }
@@ -906,6 +1332,11 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     lines.push(
       "[When the user asks for a general parse of the whole image, call vision_analyze WITHOUT a question (omit the question parameter). Only pass a question when the user asks about a specific object, text, region, or color.]",
     )
+    // 区域裁剪指引：细节看不清时，用归一化 0-1000 坐标再调一次 vision_analyze 放大；
+    // 坐标恒相对原图（非上次裁剪结果），省略 region 即整图。
+    lines.push(
+      "[For fine details (small text, dense UI), call vision_analyze again with a region [x1,y1,x2,y2] in normalized 0-1000 coordinates of the original image (0,0 top-left) to zoom in. Omit region for the whole image.]",
+    )
 
     // 注入 synthetic text part：TUI 隐藏（不干扰用户输入展示），但会发给模型。
     // id 需满足 PartID 约定（prt 前缀）。
@@ -922,14 +1353,14 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
 
   return {
     "chat.message": onChatMessage,
-    // 工具注册。参数用 JSON-Schema 形式描述（image_path / question）。
+    // 工具注册。参数用 JSON-Schema 形式描述（image_path / question / region）。
     // 类型签名上 args 是 zod RawShape，但注册表对非 zod 的参数值走
     // JSON-Schema 兼容路径运行时处理；这里做一次受控的边界转换，
     // 既不引入 zod 运行时依赖（本插件只用 node 内置模块），也不使用 any。
     tool: {
       vision_analyze: {
         description:
-          "Analyze an image with the dedicated vision model. image_path is an absolute file path (as given in the user's attachment hint) or an http(s) image URL. question is optional: pass it only when you need a specific detail (an object, text, region or color); otherwise omit it to get a full description of the whole image.",
+          "Analyze an image with the dedicated vision model. image_path is an absolute file path (as given in the user's attachment hint) or an http(s) image URL. question is optional: pass it only when you need a specific detail (an object, text, region or color); otherwise omit it to get a full description of the whole image. region is optional: pass a normalized crop to zoom into fine detail.",
         args: {
           image_path: { type: "string", description: "Absolute path to the image file, or an http(s) image URL." },
           question: {
@@ -937,10 +1368,27 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
             description:
               "Optional. What specific detail to look for (object/text/region/color). Omit for a full description of the whole image.",
           },
+          region: {
+            type: "array",
+            items: { type: "integer", minimum: 0, maximum: 1000 },
+            minItems: 4,
+            maxItems: 4,
+            description:
+              "Optional [x1,y1,x2,y2] crop region in normalized 0-1000 coordinates of the ORIGINAL image (0,0 top-left, 1000,1000 bottom-right). Applied before downscaling so the region keeps full resolution — a zoom for small text/UI detail. Intended flow: describe the whole image first, then call again with a region. Coordinates always refer to the original image, never a previous crop.",
+          },
         },
         execute: visionAnalyze,
       },
     } as unknown as NonNullable<Hooks["tool"]>,
+    // tool.definition：非 zod args 会被框架的 legacyJsonSchema 标成"全部必填"，
+    // 这里改回仅 image_path 必填，让 question / region 真正可选。
+    // jsonSchema 是运行时字段（未写入 Hooks 类型），故做存在性检测；即便字段缺失，
+    // region 的"省略/整图哨兵"兜底也能保证语义正确。
+    "tool.definition": async (hookInput, output) => {
+      if (hookInput.toolID !== "vision_analyze") return
+      const js = (output as { jsonSchema?: { required?: string[] } }).jsonSchema
+      if (js && Array.isArray(js.required)) js.required = ["image_path"]
+    },
     // dispose：清理可能残留的子会话（正常路径用后即删，这里兜底异常路径），
     // 删除失败静默忽略——插件卸载不应因清理失败而报错。
     dispose: async () => {
