@@ -212,10 +212,6 @@ npm version patch                      # 去掉 pre 段并升到正式版本
 
 逃逸舱：`npm version 1.2.3 --no-git-tag-version`（只改版本文件）或 `--ignore-scripts`（跳过全部钩子）。`npm version` 要求工作区干净；若 `postversion` 推送失败，手动执行 `git push --follow-tags`。
 
-## 许可证
-
-[MIT](./LICENSE)
-
 ## 区域裁剪工具
 
 区域裁剪通过**子进程调用**以下外部工具（不打包、不链接，均为可选；未安装时 `region` 不可用，整图功能不受影响）：
@@ -227,3 +223,7 @@ npm version patch                      # 去掉 pre 段并升到正式版本
 | GraphicsMagick（`gm`，可经 `crop_command` 指定） | 区域裁剪（兼容 ImageMagick 参数） | https://github.com/GraphicsMagick/GraphicsMagick | http://www.graphicsmagick.org |
 
 探测结果只缓存"成功"：首次探测失败时下次触发会重新探测（装好工具后无需重启 opencode）；若已缓存成功后又安装了别的工具，需退出并重进 opencode 让首次探测重跑。
+
+## 许可证
+
+[MIT](./LICENSE)

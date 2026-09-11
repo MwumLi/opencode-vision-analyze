@@ -214,10 +214,6 @@ npm version patch                      # drops the pre-release and bumps to the 
 
 Escape hatches: `npm version 1.2.3 --no-git-tag-version` (only bump the file) or `--ignore-scripts` (skip all hooks). `npm version` requires a clean working tree. If the `postversion` push fails, run `git push --follow-tags` manually.
 
-## License
-
-[MIT](./LICENSE)
-
 ## Region cropping tools
 
 Region cropping invokes the following external tools as **subprocesses** (not bundled, not linked; all optional — without one, `region` is unavailable while full-image analysis still works):
@@ -229,3 +225,7 @@ Region cropping invokes the following external tools as **subprocesses** (not bu
 | GraphicsMagick (`gm`, via `crop_command`) | region cropping (ImageMagick-compatible args) | https://github.com/GraphicsMagick/GraphicsMagick | http://www.graphicsmagick.org |
 
 Detection caches **success only**: if the first probe fails, the next trigger probes again (so a newly installed tool works without restarting opencode); if a tool was already cached and you later install a different one, restart opencode to re-run the first probe.
+
+## License
+
+[MIT](./LICENSE)
