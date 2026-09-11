@@ -818,19 +818,27 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     }
   }
 
-  // ---- 区域裁剪（外挂命令；闭包内探测结果 memoize） ----------------------------
+  // ---- 区域裁剪（外挂命令；闭包内缓存探测结果） --------------------------------
   /** 解析出的裁剪工具：file 为实际执行的可执行文件，engine 决定参数模板。 */
   type ResolvedCrop = { file: string; engine: CropEngine }
-  /** 裁剪引擎探测结果 memoize（插件实例级，进程内只探一次）。 */
-  let cropEnginePromise: Promise<ResolvedCrop | undefined> | undefined
-  const resolveCropEngine = (): Promise<ResolvedCrop | undefined> => {
-    cropEnginePromise ??= (async () => {
-      // 显式 crop_command 优先：跳过探测，模板按文件名推断。
-      if (cropCommand) return { file: cropCommand, engine: engineForCommand(cropCommand) }
-      const engine = await detectCropEngine(process.platform)
-      return engine ? { file: engine, engine } : undefined
-    })()
-    return cropEnginePromise
+  // 只缓存"探测成功"的结果：成功后不再探测；失败不落缓存，下次触发再探，
+  // 这样用户装了工具后无需重启 opencode 即可用。若已成功缓存后又装了别的工具，
+  // 仍用已缓存的那个，需重启让首次探测重跑（这是刻意取舍）。
+  let cropEngineCache: ResolvedCrop | undefined
+  // 合并并发探测：多个 region 请求同时触发时共享同一次探测，避免重复起进程。
+  let cropProbe: Promise<CropEngine | undefined> | undefined
+  const resolveCropEngine = async (): Promise<ResolvedCrop | undefined> => {
+    if (cropEngineCache) return cropEngineCache
+    // 显式 crop_command 优先：跳过探测，模板按文件名推断。
+    if (cropCommand) {
+      cropEngineCache = { file: cropCommand, engine: engineForCommand(cropCommand) }
+      return cropEngineCache
+    }
+    cropProbe ??= detectCropEngine(process.platform)
+    const engine = await cropProbe
+    cropProbe = undefined
+    if (engine) cropEngineCache = { file: engine, engine }
+    return cropEngineCache
   }
 
   // 简易并发信号量：限制同时运行的裁剪子进程数，避免批量裁剪打满 CPU 饿死事件循环。

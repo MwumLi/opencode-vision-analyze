@@ -2143,6 +2143,43 @@ describe("vision_analyze region 裁剪", () => {
     }
   })
 
+  test("探测失败不缓存：装好工具后免重启即可用；成功后不再探测", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const imgPath = path.join(dir, "big.png")
+    await writeFile(imgPath, makePng(100, 50))
+    const orig = cropRunner.exec
+    let probes = 0
+    let installed = false
+    cropRunner.exec = async (_file: string, args: string[]) => {
+      if (args.length === 1 && args[0] === "-version") {
+        probes += 1
+        if (!installed) throw new Error("ENOENT")
+        return
+      }
+      await writeFile(args[args.length - 1]!, makePng(10, 10))
+    }
+    try {
+      const analyze = getAnalyze(hooks)
+      const ctx = toolCtx(new AbortController().signal)
+      // 首次：无引擎 → 报错
+      const first = await analyze({ image_path: imgPath, region: [0, 0, 500, 500], question: "q1" }, ctx)
+      expect(first.output).toContain("requires ImageMagick")
+      const afterFirst = probes
+      // 用户"安装"工具后再次触发：应重新探测并成功
+      installed = true
+      const second = await analyze({ image_path: imgPath, region: [0, 0, 500, 500], question: "q2" }, ctx)
+      expect(second.output).not.toContain("requires ImageMagick")
+      expect(probes).toBeGreaterThan(afterFirst)
+      // 成功后：结果已缓存，不再探测
+      const afterSecond = probes
+      await analyze({ image_path: imgPath, region: [0, 0, 500, 500], question: "q3" }, ctx)
+      expect(probes).toBe(afterSecond)
+    } finally {
+      cropRunner.exec = orig
+    }
+  })
+
   test("原图超过上下文上限：只发裁剪图，不带整图上下文", async () => {
     const client = makeStubClient()
     const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
