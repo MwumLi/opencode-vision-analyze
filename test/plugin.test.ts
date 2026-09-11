@@ -2063,9 +2063,10 @@ describe("vision_analyze region 裁剪", () => {
       expect(parts[parts.length - 1]!.type).toBe("text")
       expect(stats.crops).toBe(1)
 
-      // 同图同 region 同问题再调：命中缓存，不再裁剪
+      // 同图同 region 同问题再调：命中缓存，不再裁剪；披露也要带
       const again = await analyze({ image_path: imgPath, region: [0, 0, 500, 600], question: "read the label" }, ctx)
       expect(again.title).toBe("vision_analyze (cached)")
+      expect(again.output).toContain("[Region: cropped")
       expect(stats.crops).toBe(1)
     })
   })
