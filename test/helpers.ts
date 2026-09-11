@@ -260,20 +260,22 @@ export function makePng(width: number, height: number, rgb: [number, number, num
 }
 
 /** 构造最小 JPEG（SOI + APP1 Exif Orientation + SOF0 尺寸 + EOI），仅供嗅探测试。 */
-export function makeExifJpeg(width: number, height: number, orientation: number): Buffer {
+export function makeExifJpeg(width: number, height: number, orientation: number, little = false): Buffer {
   const app1 = Buffer.alloc(2 + 6 + 2 + 2 + 4 + 2 + 12 + 4)
   app1.writeUInt16BE(app1.length, 0)
   app1.write("Exif", 2, "latin1")
   app1.writeUInt16BE(0, 6) // 填充
-  app1.write("MM", 8, "latin1") // TIFF 大端
-  app1.writeUInt16BE(0x2a, 10)
-  app1.writeUInt32BE(8, 12) // IFD0 偏移
-  app1.writeUInt16BE(1, 16) // 条目数
-  app1.writeUInt16BE(0x0112, 18) // Orientation tag
-  app1.writeUInt16BE(3, 20) // SHORT
-  app1.writeUInt32BE(1, 22)
-  app1.writeUInt16BE(orientation, 26)
-  app1.writeUInt32BE(0, 28)
+  app1.write(little ? "II" : "MM", 8, "latin1") // TIFF 字节序
+  const u16 = (v: number, at: number) => (little ? app1.writeUInt16LE(v, at) : app1.writeUInt16BE(v, at))
+  const u32 = (v: number, at: number) => (little ? app1.writeUInt32LE(v, at) : app1.writeUInt32BE(v, at))
+  u16(0x2a, 10)
+  u32(8, 12) // IFD0 偏移
+  u16(1, 16) // 条目数
+  u16(0x0112, 18) // Orientation tag
+  u16(3, 20) // SHORT
+  u32(1, 22)
+  u16(orientation, 26)
+  u32(0, 28)
   const sof = Buffer.alloc(11)
   sof.writeUInt16BE(0xffc0, 0)
   sof.writeUInt16BE(11, 2)
@@ -281,4 +283,27 @@ export function makeExifJpeg(width: number, height: number, orientation: number)
   sof.writeUInt16BE(height, 5)
   sof.writeUInt16BE(width, 7)
   return Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1]), app1, sof, Buffer.from([0xff, 0xd9])])
+}
+
+/** 构造最小 GIF 头（逻辑屏幕宽高，小端）。 */
+export function makeGif(width: number, height: number): Buffer {
+  const buf = Buffer.alloc(13)
+  buf.write("GIF89a", 0, "latin1")
+  buf.writeUInt16LE(width, 6)
+  buf.writeUInt16LE(height, 8)
+  return buf
+}
+
+/** 构造最小 WebP VP8L（无损）头：RIFF/WEBP/VP8L + 0x2f 签名 + 14-bit 宽高。 */
+export function makeWebpVp8l(width: number, height: number): Buffer {
+  const buf = Buffer.alloc(25)
+  buf.write("RIFF", 0, "latin1")
+  buf.writeUInt32LE(17, 4)
+  buf.write("WEBP", 8, "latin1")
+  buf.write("VP8L", 12, "latin1")
+  buf.writeUInt32LE(5, 16)
+  buf[20] = 0x2f
+  // bits = (width-1) | ((height-1) << 14)
+  buf.writeUInt32LE(((width - 1) & 0x3fff) | (((height - 1) & 0x3fff) << 14), 21)
+  return buf
 }

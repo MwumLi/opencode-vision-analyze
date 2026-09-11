@@ -35,7 +35,7 @@
  * 坐标相对原图、恒可迭代，无 region 行为与缓存 key 完全不变。
  * 另注册 tool.definition 钩子：框架会把非 zod 参数全标 required，这里改回仅 image_path。
  *
- * 说明：本插件只用 node 内置模块（crypto/fs/path），无任何运行时外部依赖，
+ * 说明：本插件只用 node 内置模块（crypto/fs/path/os/child_process），无任何运行时外部依赖，
  * 类型依赖仅 @opencode-ai/plugin 与 @opencode-ai/sdk 的 type import。
  *
  * 已知限制：
@@ -173,24 +173,28 @@ function jpegSize(bytes: Buffer): { width: number; height: number } | undefined 
 
 /** 读 WebP 宽高（VP8 / VP8L / VP8X 三种子格式）。 */
 function webpSize(bytes: Buffer): { width: number; height: number } | undefined {
-  if (bytes.length < 30 || bytes.toString("latin1", 0, 4) !== "RIFF" || bytes.toString("latin1", 8, 12) !== "WEBP") {
+  if (bytes.length < 16 || bytes.toString("latin1", 0, 4) !== "RIFF" || bytes.toString("latin1", 8, 12) !== "WEBP") {
     return undefined
   }
   const format = bytes.toString("latin1", 12, 16)
   if (format === "VP8X") {
+    if (bytes.length < 30) return undefined
     return {
       width: 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)),
       height: 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)),
     }
   }
-  if (format === "VP8L" && bytes.length >= 25 && bytes[20] === 0x2f) {
+  if (format === "VP8L") {
+    // 最小 VP8L 头到 bits 字段共 25 字节，故按子格式单独判长度，别用统一的 30。
+    if (bytes.length < 25 || bytes[20] !== 0x2f) return undefined
     const bits = bytes.readUInt32LE(21)
     return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >> 14) & 0x3fff) }
   }
   if (format === "VP8 ") {
+    if (bytes.length < 30) return undefined
     // 关键帧起始码 9d 01 2a 之后是 14-bit 宽高（小端）。
     const start = 20
-    if (bytes.length >= start + 10 && bytes[start + 3] === 0x9d && bytes[start + 4] === 0x01 && bytes[start + 5] === 0x2a) {
+    if (bytes[start + 3] === 0x9d && bytes[start + 4] === 0x01 && bytes[start + 5] === 0x2a) {
       return {
         width: bytes.readUInt16LE(start + 6) & 0x3fff,
         height: bytes.readUInt16LE(start + 8) & 0x3fff,
@@ -323,6 +327,13 @@ export async function detectCropEngine(platform: string): Promise<CropEngine | u
 
 /** 有 region 时泛解析条目的最短文本长度（区域描述天然可短，但仍防垃圾）。 */
 export const regionGenericMinText = { chars: 24 }
+
+/**
+ * 有 region 时，作为全局上下文随裁剪图一起发送的原图字节上限（默认 8 MB）。
+ * 原图过大就只发裁剪图——避免为了上下文反而把请求顶到 provider 上限。
+ * 模块级可变对象，测试可注入小值。
+ */
+export const regionContextLimits = { maxBytes: 8 * 1024 * 1024 }
 
 /**
  * 内部超时错误类型（name = "DeadlineError"）。
@@ -823,6 +834,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   }
 
   // 简易并发信号量：限制同时运行的裁剪子进程数，避免批量裁剪打满 CPU 饿死事件循环。
+  // 释放时把名额**直接移交**给下一个等待者（等待者不再自增），避免"先减后加"的瞬时超限。
   let activeCrops = 0
   const cropWaiters: Array<() => void> = []
   const acquireCropSlot = async (): Promise<void> => {
@@ -830,12 +842,13 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       activeCrops += 1
       return
     }
+    // 被 releaseCropSlot 唤醒时名额已移交，无需再自增。
     await new Promise<void>((resolve) => cropWaiters.push(resolve))
-    activeCrops += 1
   }
   const releaseCropSlot = (): void => {
-    activeCrops -= 1
-    cropWaiters.shift()?.()
+    const next = cropWaiters.shift()
+    if (next) next()
+    else activeCrops -= 1
   }
 
   /**
@@ -1062,6 +1075,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         }
       }
 
+      // 有 region 时附坐标披露：裁剪区在原图的像素边界，以及"视觉模型报的坐标相对裁剪原点"，
+      // 便于主模型把区域坐标映射回原图、继续迭代裁剪。命中缓存也要带，故提前算好。
+      const disclosure = regionRect
+        ? `\n\n[Region: cropped [x=${regionRect.left}, y=${regionRect.top}, w=${regionRect.width}, h=${regionRect.height}] from the original image (${regionDims}); any coordinates the vision model reports are relative to this crop origin.]`
+        : ""
+
       // 描述缓存：内容哈希 + 生效问题作为 key，命中直接复用（title 标注 cached）。
       // 有 region 时在 key 里带上原始归一化区域，与整图条目隔离；无 region 保持旧格式，
       // 存量条目照常命中。落盘在用户级共享目录——跨项目/进程/重启命中；磁盘即事实。
@@ -1071,24 +1090,23 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       if (cached !== undefined) {
         // 命中时标签沿用入库时的模型（cached.modelId）：即便此刻候选链链首
         // 已与入库模型不同，也保持标签真实、不重写。
-        return { title: `${title} (cached)`, output: format(path.basename(imagePath), cached.modelId, cached.text) }
+        return {
+          title: `${title} (cached)`,
+          output: format(path.basename(imagePath), cached.modelId, cached.text) + disclosure,
+        }
       }
 
       // miss：有 region 才裁剪（命中缓存时不白跑外部命令）。裁剪图在前、原图作上下文，
-      // 因为视觉子会话是全新会话，看不到之前的整图描述。
+      // 因为视觉子会话是全新会话，看不到之前的整图描述；原图过大则只发裁剪图，
+      // 避免为了上下文反而把请求顶到 provider 上限。
       let images: Array<{ bytes: Buffer; mime: string }> = [image]
       if (regionRect) {
         const cropped = await cropImage(imagePath, regionRect, ctx)
         if ("error" in cropped) return { title, output: `Image analysis failed: ${cropped.error}` }
-        images = [cropped, image]
+        images = image.bytes.length <= regionContextLimits.maxBytes ? [cropped, image] : [cropped]
       }
       const result = await describeWithChain(images, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
-      // 有 region 时附坐标披露：裁剪区在原图的像素边界，以及"视觉模型报的坐标相对裁剪原点"，
-      // 便于主模型把区域坐标映射回原图、继续迭代裁剪。
-      const disclosure = regionRect
-        ? `\n\n[Region: cropped [x=${regionRect.left}, y=${regionRect.top}, w=${regionRect.width}, h=${regionRect.height}] from the original image (${regionDims}); any coordinates the vision model reports are relative to this crop origin.]`
-        : ""
       // 泛解析条目是全图共享的：文本太短多半是视觉模型敷衍/拒答，存进去会毒化这条
       // canonical 缓存。有 region 时用更小的下限——区域描述天然可短，但仍防短垃圾。
       // 具体追问不受限（"答案是 42" 是合法短答案）。

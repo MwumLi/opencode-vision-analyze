@@ -8,7 +8,7 @@ English | [简体中文](./README.zh.md)
 
 A tool-based vision routing plugin for [opencode](https://opencode.ai): when the main model can't see images, it calls the `vision_analyze` tool on demand — your dedicated vision model describes the image and the description flows straight back into the conversation. When the main model already supports images, pasted images pass through untouched and the tool short-circuits to return raw pixels.
 
-**Zero runtime dependencies.** Only node builtins (`crypto`/`fs`/`path`) and type-only imports — nothing to install beyond the plugin itself.
+**Zero runtime dependencies.** Only node builtins (`crypto`/`fs`/`path`/`os`/`child_process`) and type-only imports — nothing to install beyond the plugin itself.
 
 ## Features
 
@@ -170,6 +170,13 @@ Key behaviors:
 - **The tool never throws** — every failure returns readable text so the agent loop can retry, rephrase, or inform the user.
 - **URL images** — `image_path` accepts `http(s)://...` URLs (must end in a supported image extension: png/jpg/jpeg/gif/webp).
 - **General parses share one cache entry** — an empty or omitted `question` is treated as a full-image parse and reuses that image's cached description; specific follow-ups keep their own entries (details in *Storage and caches*).
+
+## Known limitations
+
+- **Region cropping needs an external tool**: ImageMagick (`magick`/`convert`) or `ffmpeg` must be installed. Without one, `region` is unavailable (clear error) while full-image analysis still works.
+- **EXIF auto-orient covers JPEG**: the plugin sniffs JPEG orientation and the engine auto-orients. `ffmpeg`'s auto-rotate depends on its build/version (newer builds do it by default); if a rotated JPEG crops the wrong area, use ImageMagick or rotate the image first.
+- **Coordinates are estimates**: the main model cannot see the image, so `region` is its estimate and may miss. Errors include the real image dimensions so it can retry.
+- **Large-image context is dropped**: when the original exceeds 8 MB, a `region` request sends only the crop, without full-image context.
 
 ## Roadmap
 

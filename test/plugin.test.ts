@@ -31,6 +31,8 @@ import {
   providersStub,
   makePng,
   makeExifJpeg,
+  makeGif,
+  makeWebpVp8l,
   type LoadedPlugin,
   type StubProvidersResult,
 } from "./helpers"
@@ -54,7 +56,9 @@ import {
   cropEngineCandidates,
   cropRunner,
   detectCropEngine,
+  engineForCommand,
   regionGenericMinText,
+  regionContextLimits,
 } from "../src/index"
 
 /** 当前测试的临时项目目录（beforeEach 建立）。 */
@@ -1892,6 +1896,18 @@ describe("imageSize 图片尺寸嗅探", () => {
   test("JPEG orientation=1 不交换宽高", () => {
     expect(imageSize(makeExifJpeg(3, 2, 1))).toEqual({ width: 3, height: 2, orientation: 1 })
   })
+
+  test("JPEG orientation 小端（II）同样解析", () => {
+    expect(imageSize(makeExifJpeg(3, 2, 6, true))).toEqual({ width: 2, height: 3, orientation: 6 })
+  })
+
+  test("GIF 宽高嗅探", () => {
+    expect(imageSize(makeGif(4, 7))).toEqual({ width: 4, height: 7, orientation: 1 })
+  })
+
+  test("WebP VP8L 宽高嗅探（最小 25 字节）", () => {
+    expect(imageSize(makeWebpVp8l(12, 9))).toEqual({ width: 12, height: 9, orientation: 1 })
+  })
 })
 
 describe("region 校验 / 映射 / 命令构造", () => {
@@ -1994,6 +2010,13 @@ describe("裁剪执行器探测", () => {
       cropRunner.exec = orig
     }
   })
+
+  test("engineForCommand：按可执行文件名推断模板", () => {
+    expect(engineForCommand("/usr/bin/ffmpeg")).toBe("ffmpeg")
+    expect(engineForCommand("convert")).toBe("convert")
+    expect(engineForCommand("magick")).toBe("magick")
+    expect(engineForCommand("/opt/gm")).toBe("magick")
+  })
 })
 
 test("regionGenericMinText 默认 24", () => {
@@ -2088,6 +2111,90 @@ describe("vision_analyze region 裁剪", () => {
       const analyze = getAnalyze(hooks)
       const result = await analyze({ image_path: imgPath, region: [0, 0, 500, 500] }, toolCtx(new AbortController().signal))
       expect(result.output).toContain("requires ImageMagick")
+    } finally {
+      cropRunner.exec = orig
+    }
+  })
+
+  test("crop_command 选项：跳过探测，直接使用指定命令", async () => {
+    const client = makeStubClient()
+    const calls: string[] = []
+    const orig = cropRunner.exec
+    cropRunner.exec = async (file: string, args: string[]) => {
+      calls.push(`${file}:${args[0]}`)
+      if (args.length === 1 && args[0] === "-version") return
+      await writeFile(args[args.length - 1]!, makePng(10, 10))
+    }
+    try {
+      const { hooks } = await loadPlugin(makePluginInput(dir, client), {
+        models: ["test/vision-model"],
+        crop_command: "/opt/bin/ffmpeg",
+      })
+      const imgPath = path.join(dir, "big.png")
+      await writeFile(imgPath, makePng(100, 50))
+      const analyze = getAnalyze(hooks)
+      await analyze({ image_path: imgPath, region: [0, 0, 500, 500], question: "q" }, toolCtx(new AbortController().signal))
+      // 无 -version 探测；第一次执行即 ffmpeg 裁剪（args[0] = -y）
+      expect(calls[0]).toBe("/opt/bin/ffmpeg:-y")
+      expect(calls.some((c) => c.endsWith(":-version"))).toBe(false)
+    } finally {
+      cropRunner.exec = orig
+    }
+  })
+
+  test("原图超过上下文上限：只发裁剪图，不带整图上下文", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const imgPath = path.join(dir, "big.png")
+    await writeFile(imgPath, makePng(100, 50))
+    const saved = regionContextLimits.maxBytes
+    regionContextLimits.maxBytes = 1 // 强制跳过上下文图
+    try {
+      await withFakeCrop(async () => {
+        const analyze = getAnalyze(hooks)
+        await analyze({ image_path: imgPath, region: [0, 0, 500, 500], question: "q" }, toolCtx(new AbortController().signal))
+        const parts = client.calls.prompt[0]!.parts as Array<{ type: string }>
+        expect(parts.filter((p) => p.type === "file").length).toBe(1)
+      })
+    } finally {
+      regionContextLimits.maxBytes = saved
+    }
+  })
+
+  test("快速路径 + region：返回单个裁剪附件", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const imgPath = path.join(dir, "big.png")
+    await writeFile(imgPath, makePng(100, 50))
+    // 让会话当前模型为有视觉能力的 vision-model → 触发快速路径
+    await hooks["chat.message"]!(
+      chatInput({ sessionID: "ses_1", model: VISION_MODEL }) as never,
+      chatOutput([imagePart()]) as never,
+    )
+    await withFakeCrop(async () => {
+      const analyze = getAnalyze(hooks)
+      const result = await analyze({ image_path: imgPath, region: [0, 0, 500, 500] }, toolCtx(new AbortController().signal))
+      expect(result.attachments?.length).toBe(1)
+      expect(result.attachments?.[0]?.mime).toBe("image/png")
+      // 快速路径不建子会话
+      expect(client.calls.prompt.length).toBe(0)
+    })
+  })
+
+  test("裁剪被 abort：返回可读错误，不抛错", async () => {
+    const client = makeStubClient()
+    const { hooks } = await loadPlugin(makePluginInput(dir, client), { models: ["test/vision-model"] })
+    const imgPath = path.join(dir, "big.png")
+    await writeFile(imgPath, makePng(100, 50))
+    const orig = cropRunner.exec
+    cropRunner.exec = async (_file: string, args: string[]) => {
+      if (args.length === 1 && args[0] === "-version") return
+      throw new DOMException("Aborted", "AbortError")
+    }
+    try {
+      const analyze = getAnalyze(hooks)
+      const result = await analyze({ image_path: imgPath, region: [0, 0, 500, 500] }, toolCtx(new AbortController().signal))
+      expect(result.output).toContain("region crop failed")
     } finally {
       cropRunner.exec = orig
     }
