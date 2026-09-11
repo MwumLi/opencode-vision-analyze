@@ -579,11 +579,16 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    */
   const attemptModel = async (
     candidate: { providerID: string; modelID: string },
-    image: { bytes: Buffer; mime: string },
+    images: Array<{ bytes: Buffer; mime: string }>,
     question: string,
     ctx: ToolContext,
   ): Promise<{ ok: true; text: string } | { ok: false; error: string; aborted?: boolean }> => {
-    const dataURL = `data:${image.mime};base64,${image.bytes.toString("base64")}`
+    // 多图按序拼进 parts：有 region 时是 [裁剪图, 原图]，无 region 时只有原图。
+    const fileParts = images.map((image) => ({
+      type: "file" as const,
+      mime: image.mime,
+      url: `data:${image.mime};base64,${image.bytes.toString("base64")}`,
+    }))
     let subID: string | undefined
     // "回合可能仍在飞"标记：请求被本地 deadline（超时）或用户 abort 掐断时置位，
     // finally 据此先 abort 子会话（取消 provider 端孤儿回合）再 delete。
@@ -608,10 +613,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
             // vision_analyze 形成递归，也避免任何副作用。
             tools: { "*": false },
             system: VISION_SYSTEM_PROMPT,
-            parts: [
-              { type: "file", mime: image.mime, url: dataURL },
-              { type: "text", text: question },
-            ],
+            parts: [...fileParts, { type: "text", text: question }],
           },
         }),
         ctx,
@@ -650,7 +652,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * 全部失败聚合各候选原因；空链返回友好错误。本函数永不抛错。
    */
   const describeWithChain = async (
-    image: { bytes: Buffer; mime: string },
+    images: Array<{ bytes: Buffer; mime: string }>,
     question: string,
     ctx: ToolContext,
   ): Promise<{ ok: true; text: string; modelId: string } | { ok: false; error: string }> => {
@@ -659,7 +661,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     const chain = await resolveChain()
     const failures: string[] = []
     for (const candidate of chain) {
-      const attempt = await attemptModel(candidate, image, question, ctx)
+      const attempt = await attemptModel(candidate, images, question, ctx)
       if (attempt.ok) return { ok: true, text: attempt.text, modelId: modelRefKey(candidate) }
       if (attempt.aborted) return { ok: false, error: attempt.error } // abort 中止整链
       failures.push(`${modelRefKey(candidate)}: ${attempt.error}`)
@@ -783,6 +785,62 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     }
   }
 
+  // ---- 区域裁剪（外挂命令；闭包内探测结果 memoize） ----------------------------
+  /** 裁剪引擎探测结果 memoize（插件实例级，进程内只探一次）。 */
+  let cropEnginePromise: Promise<CropEngine | undefined> | undefined
+  const resolveCropEngine = (): Promise<CropEngine | undefined> => {
+    cropEnginePromise ??= detectCropEngine(process.platform)
+    return cropEnginePromise
+  }
+
+  // 简易并发信号量：限制同时运行的裁剪子进程数，避免批量裁剪打满 CPU 饿死事件循环。
+  let activeCrops = 0
+  const cropWaiters: Array<() => void> = []
+  const acquireCropSlot = async (): Promise<void> => {
+    if (activeCrops < regionCropLimits.maxConcurrent) {
+      activeCrops += 1
+      return
+    }
+    await new Promise<void>((resolve) => cropWaiters.push(resolve))
+    activeCrops += 1
+  }
+  const releaseCropSlot = (): void => {
+    activeCrops -= 1
+    cropWaiters.shift()?.()
+  }
+
+  /**
+   * 按 region 裁剪图片，返回裁剪后的 PNG 字节（临时文件即用即删）。
+   * 任何失败（无引擎 / 命令失败 / 超时 / 读取失败）都返回 { error }，不抛错。
+   */
+  const cropImage = async (
+    inputPath: string,
+    rect: PixelRect,
+    ctx: ToolContext,
+  ): Promise<{ bytes: Buffer; mime: string } | { error: string }> => {
+    const engine = await resolveCropEngine()
+    if (!engine) {
+      return {
+        error: "region cropping requires ImageMagick (magick/convert) or ffmpeg; install one or omit region",
+      }
+    }
+    await acquireCropSlot()
+    let tmpDir: string | undefined
+    try {
+      tmpDir = await fs.mkdtemp(path.join(tmpdir(), "vision-crop-"))
+      const out = path.join(tmpDir, `crop-${randomUUID()}.png`)
+      await cropRunner.exec(engine, buildCropArgs(engine, inputPath, rect, out), ctx.abort)
+      const bytes = await fs.readFile(out)
+      if (bytes.length === 0) return { error: "region crop produced an empty image" }
+      return { bytes, mime: "image/png" }
+    } catch (error) {
+      return { error: `region crop failed: ${errText(error)}` }
+    } finally {
+      releaseCropSlot()
+      if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
   // ---- 描述缓存（用户级目录落盘，磁盘即事实；全链 fail-open） ---------------------
   /** 描述缓存 key → 磁盘文件路径（<dir>/<sha256(key)>.json）。 */
   const descCacheFile = (key: string): string =>
@@ -885,7 +943,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
    * 自行决定下一步（重试、换问题或告知用户）。
    */
   const visionAnalyze = async (
-    args: { image_path: string; question?: string },
+    args: { image_path: string; question?: string; region?: unknown },
     ctx: ToolContext,
   ): Promise<ToolResult> => {
     const title = "vision_analyze"
@@ -911,10 +969,57 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         return { title, output: `Image not found or unsupported: ${args.image_path}` }
       }
 
-      // 快速路径：主模型本身具备视觉能力时，不再走子会话描述，直接把原图
-      // 作为附件回传给模型自行查看（省一次往返，模型看到的是原图而非转述）。
+      // region 解析（纯计算，不调外部命令）：非法直接报错；整图哨兵视为无 region。
+      // 尺寸/映射只在这里算一次，后续快速路径、缓存 key、裁剪都复用。
+      let regionRect: PixelRect | undefined
+      let regionTag = ""
+      let regionDims = ""
+      if (args.region !== undefined) {
+        const parsed = parseRegion(args.region)
+        if (!parsed) {
+          return {
+            title,
+            output:
+              "Image analysis failed: invalid region; expected [x1,y1,x2,y2] as four integers in 0-1000 (normalized, top-left origin)",
+          }
+        }
+        if (!isWholeImageRegion(parsed)) {
+          const info = imageSize(image.bytes)
+          if (!info) {
+            return { title, output: "Image analysis failed: cannot determine image dimensions for region crop" }
+          }
+          const rect = regionToPixels(parsed, info)
+          if (!rect) {
+            return {
+              title,
+              output: `Image analysis failed: invalid region crops to zero area; image is ${info.width}x${info.height} px`,
+            }
+          }
+          regionRect = rect
+          regionTag = regionKey(parsed)
+          regionDims = `${info.width}x${info.height}`
+        }
+      }
+
+      // 快速路径：主模型本身具备视觉能力时，不再走子会话描述，直接把图作为附件
+      // 回传。有 region 时回裁剪图（同样先裁再发，主模型看到的是放大后的细节）。
       const current = sessionModels.get(ctx.sessionID)
       if (current && (await imageSupport(current.providerID, current.modelID))) {
+        if (regionRect) {
+          const cropped = await cropImage(imagePath, regionRect, ctx)
+          if ("error" in cropped) return { title, output: `Image analysis failed: ${cropped.error}` }
+          return {
+            title,
+            output: `[Image attached for direct inspection: ${path.basename(imagePath)} (region ${regionTag})]`,
+            attachments: [
+              {
+                type: "file",
+                mime: cropped.mime,
+                url: `data:${cropped.mime};base64,${cropped.bytes.toString("base64")}`,
+              },
+            ],
+          }
+        }
         return {
           title,
           output: `[Image attached for direct inspection: ${path.basename(imagePath)}]`,
@@ -929,8 +1034,10 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
       }
 
       // 描述缓存：内容哈希 + 生效问题作为 key，命中直接复用（title 标注 cached）。
-      // 落盘在用户级共享目录（resolveDescriptionDir）——跨项目/进程/重启命中；磁盘即事实。
-      const key = `${createHash("sha256").update(image.bytes).digest("hex")}:${question}`
+      // 有 region 时在 key 里带上原始归一化区域，与整图条目隔离；无 region 保持旧格式，
+      // 存量条目照常命中。落盘在用户级共享目录——跨项目/进程/重启命中；磁盘即事实。
+      const sha = createHash("sha256").update(image.bytes).digest("hex")
+      const key = regionTag ? `${sha}:${regionTag}|${question}` : `${sha}:${question}`
       const cached = await descCacheGet(key)
       if (cached !== undefined) {
         // 命中时标签沿用入库时的模型（cached.modelId）：即便此刻候选链链首
@@ -938,18 +1045,32 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
         return { title: `${title} (cached)`, output: format(path.basename(imagePath), cached.modelId, cached.text) }
       }
 
-      const result = await describeWithChain(image, question, ctx)
+      // miss：有 region 才裁剪（命中缓存时不白跑外部命令）。裁剪图在前、原图作上下文，
+      // 因为视觉子会话是全新会话，看不到之前的整图描述。
+      let images: Array<{ bytes: Buffer; mime: string }> = [image]
+      if (regionRect) {
+        const cropped = await cropImage(imagePath, regionRect, ctx)
+        if ("error" in cropped) return { title, output: `Image analysis failed: ${cropped.error}` }
+        images = [cropped, image]
+      }
+      const result = await describeWithChain(images, question, ctx)
       if (!result.ok) return { title, output: `Image analysis failed: ${result.error}` }
+      // 有 region 时附坐标披露：裁剪区在原图的像素边界，以及"视觉模型报的坐标相对裁剪原点"，
+      // 便于主模型把区域坐标映射回原图、继续迭代裁剪。
+      const disclosure = regionRect
+        ? `\n\n[Region: cropped [x=${regionRect.left}, y=${regionRect.top}, w=${regionRect.width}, h=${regionRect.height}] from the original image (${regionDims}); any coordinates the vision model reports are relative to this crop origin.]`
+        : ""
       // 泛解析条目是全图共享的：文本太短多半是视觉模型敷衍/拒答，存进去会毒化这条
-      // canonical 缓存，让以后所有泛解析都命中垃圾描述，所以低于门槛就跳过落盘。
+      // canonical 缓存。有 region 时用更小的下限——区域描述天然可短，但仍防短垃圾。
       // 具体追问不受限（"答案是 42" 是合法短答案）。
-      if (generic && result.text.length < genericWriteMinText.chars) {
-        return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
+      const minChars = regionRect ? regionGenericMinText.chars : genericWriteMinText.chars
+      if (generic && result.text.length < minChars) {
+        return { title, output: format(path.basename(imagePath), result.modelId, result.text) + disclosure }
       }
       // 入库带上实际产出描述的候选 modelId，供后续缓存命中还原真实标签
       await descCacheSet(key, { modelId: result.modelId, text: result.text })
       // 成功标签直接用实际产出描述的候选引用键（而非链首近似）
-      return { title, output: format(path.basename(imagePath), result.modelId, result.text) }
+      return { title, output: format(path.basename(imagePath), result.modelId, result.text) + disclosure }
     } catch (error) {
       return { title, output: `Image analysis failed: ${errText(error)}` }
     }
@@ -1156,6 +1277,11 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     lines.push(
       "[When the user asks for a general parse of the whole image, call vision_analyze WITHOUT a question (omit the question parameter). Only pass a question when the user asks about a specific object, text, region, or color.]",
     )
+    // 区域裁剪指引：细节看不清时，用归一化 0-1000 坐标再调一次 vision_analyze 放大；
+    // 坐标恒相对原图（非上次裁剪结果），省略 region 即整图。
+    lines.push(
+      "[For fine details (small text, dense UI), call vision_analyze again with a region [x1,y1,x2,y2] in normalized 0-1000 coordinates of the original image (0,0 top-left) to zoom in. Omit region for the whole image.]",
+    )
 
     // 注入 synthetic text part：TUI 隐藏（不干扰用户输入展示），但会发给模型。
     // id 需满足 PartID 约定（prt 前缀）。
@@ -1172,14 +1298,14 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
 
   return {
     "chat.message": onChatMessage,
-    // 工具注册。参数用 JSON-Schema 形式描述（image_path / question）。
+    // 工具注册。参数用 JSON-Schema 形式描述（image_path / question / region）。
     // 类型签名上 args 是 zod RawShape，但注册表对非 zod 的参数值走
     // JSON-Schema 兼容路径运行时处理；这里做一次受控的边界转换，
     // 既不引入 zod 运行时依赖（本插件只用 node 内置模块），也不使用 any。
     tool: {
       vision_analyze: {
         description:
-          "Analyze an image with the dedicated vision model. image_path is an absolute file path (as given in the user's attachment hint) or an http(s) image URL. question is optional: pass it only when you need a specific detail (an object, text, region or color); otherwise omit it to get a full description of the whole image.",
+          "Analyze an image with the dedicated vision model. image_path is an absolute file path (as given in the user's attachment hint) or an http(s) image URL. question is optional: pass it only when you need a specific detail (an object, text, region or color); otherwise omit it to get a full description of the whole image. region is optional: pass a normalized crop to zoom into fine detail.",
         args: {
           image_path: { type: "string", description: "Absolute path to the image file, or an http(s) image URL." },
           question: {
@@ -1187,10 +1313,27 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
             description:
               "Optional. What specific detail to look for (object/text/region/color). Omit for a full description of the whole image.",
           },
+          region: {
+            type: "array",
+            items: { type: "integer", minimum: 0, maximum: 1000 },
+            minItems: 4,
+            maxItems: 4,
+            description:
+              "Optional [x1,y1,x2,y2] crop region in normalized 0-1000 coordinates of the ORIGINAL image (0,0 top-left, 1000,1000 bottom-right). Applied before downscaling so the region keeps full resolution — a zoom for small text/UI detail. Intended flow: describe the whole image first, then call again with a region. Coordinates always refer to the original image, never a previous crop.",
+          },
         },
         execute: visionAnalyze,
       },
     } as unknown as NonNullable<Hooks["tool"]>,
+    // tool.definition：非 zod args 会被框架的 legacyJsonSchema 标成"全部必填"，
+    // 这里改回仅 image_path 必填，让 question / region 真正可选。
+    // jsonSchema 是运行时字段（未写入 Hooks 类型），故做存在性检测；即便字段缺失，
+    // region 的"省略/整图哨兵"兜底也能保证语义正确。
+    "tool.definition": async (hookInput, output) => {
+      if (hookInput.toolID !== "vision_analyze") return
+      const js = (output as { jsonSchema?: { required?: string[] } }).jsonSchema
+      if (js && Array.isArray(js.required)) js.required = ["image_path"]
+    },
     // dispose：清理可能残留的子会话（正常路径用后即删，这里兜底异常路径），
     // 删除失败静默忽略——插件卸载不应因清理失败而报错。
     dispose: async () => {
