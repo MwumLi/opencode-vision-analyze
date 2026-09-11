@@ -169,10 +169,6 @@ vision_analyze 工具：
 - **URL 图片** —— `image_path` 接受 `http(s)://...` 地址（需以受支持的图片扩展名结尾：png/jpg/jpeg/gif/webp）。
 - **泛解析共享同一条缓存** —— 空 / 省略的 `question` 视为整图描述，复用该图已缓存的描述；具体追问各自保留条目（细节见「存储与缓存」）。
 
-## Roadmap
-
-- [x] 区域裁剪（放大查看图片细节）
-
 ## 已知限制
 
 - **区域裁剪需自备外部工具**：需安装 ImageMagick（`magick`/`convert`）或 `ffmpeg`；都没有时 `region` 不可用（返回清晰错误），整图解析不受影响。
@@ -219,3 +215,15 @@ npm version patch                      # 去掉 pre 段并升到正式版本
 ## 许可证
 
 [MIT](./LICENSE)
+
+## 区域裁剪工具
+
+区域裁剪通过**子进程调用**以下外部工具（不打包、不链接，均为可选；未安装时 `region` 不可用，整图功能不受影响）：
+
+| 工具 | 用途 | GitHub | 主页 |
+|---|---|---|---|
+| ImageMagick（`magick` / `convert`） | 区域裁剪（首选） | https://github.com/ImageMagick/ImageMagick | https://imagemagick.org |
+| FFmpeg（`ffmpeg`） | 区域裁剪（备选） | https://github.com/FFmpeg/FFmpeg | https://ffmpeg.org |
+| GraphicsMagick（`gm`，可经 `crop_command` 指定） | 区域裁剪（兼容 ImageMagick 参数） | https://github.com/GraphicsMagick/GraphicsMagick | http://www.graphicsmagick.org |
+
+探测结果只缓存"成功"：首次探测失败时下次触发会重新探测（装好工具后无需重启 opencode）；若已缓存成功后又安装了别的工具，需退出并重进 opencode 让首次探测重跑。

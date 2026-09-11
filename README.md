@@ -178,10 +178,6 @@ Key behaviors:
 - **Coordinates are estimates**: the main model cannot see the image, so `region` is its estimate and may miss. Errors include the real image dimensions so it can retry.
 - **Large-image context is dropped**: when the original exceeds 8 MB, a `region` request sends only the crop, without full-image context.
 
-## Roadmap
-
-- [x] Region cropping for zooming into image details
-
 ## Development
 
 ```bash
@@ -221,3 +217,15 @@ Escape hatches: `npm version 1.2.3 --no-git-tag-version` (only bump the file) or
 ## License
 
 [MIT](./LICENSE)
+
+## Region cropping tools
+
+Region cropping invokes the following external tools as **subprocesses** (not bundled, not linked; all optional — without one, `region` is unavailable while full-image analysis still works):
+
+| Tool | Use | GitHub | Homepage |
+|---|---|---|---|
+| ImageMagick (`magick` / `convert`) | region cropping (preferred) | https://github.com/ImageMagick/ImageMagick | https://imagemagick.org |
+| FFmpeg (`ffmpeg`) | region cropping (fallback) | https://github.com/FFmpeg/FFmpeg | https://ffmpeg.org |
+| GraphicsMagick (`gm`, via `crop_command`) | region cropping (ImageMagick-compatible args) | https://github.com/GraphicsMagick/GraphicsMagick | http://www.graphicsmagick.org |
+
+Detection caches **success only**: if the first probe fails, the next trigger probes again (so a newly installed tool works without restarting opencode); if a tool was already cached and you later install a different one, restart opencode to re-run the first probe.
