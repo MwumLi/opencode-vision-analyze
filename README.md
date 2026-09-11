@@ -16,6 +16,7 @@ A tool-based vision routing plugin for [opencode](https://opencode.ai): when the
 - **Question-aware descriptions.** The model passes its own focused question to `vision_analyze` — not a one-shot generic caption computed at submit time. For a general parse of an image the model leaves `question` empty, and the tool falls back to a fixed prompt so all generic descriptions of the same image share one cache entry (see *Content-addressed cache*).
 - **Native fast path.** If the main model is vision-capable, `vision_analyze` skips the vision model entirely and returns the raw image as a tool attachment.
 - **Content-addressed cache.** Images and descriptions are stored by content hash in user-level shared dirs and reused across sessions, projects and restarts — the same image is never described twice, and all generic full-image parses collapse onto that image's single entry. Storage layout, size limits and the canonical prompt are detailed in *Storage and caches* below.
+- **Region cropping (zoom into detail).** Small text and dense UI in a large image get blurred by the model's internal downscaling. The main model can describe the whole image first, then call `vision_analyze` again with a `region` (normalized 0–1000 coordinates); the plugin crops that region out **before downscaling**, so the small area keeps the full resolution budget — effectively a zoom. Cropping shells out to ImageMagick / ffmpeg (detected at runtime), so there are still **zero runtime dependencies**; when neither is installed it returns a clear error and full-image analysis is unaffected.
 - **Unified auth.** The vision call runs through an opencode sub-session, so it reuses the provider credentials opencode already manages. No extra API key plumbing.
 
 ## Installation
@@ -66,6 +67,7 @@ Notes for the curl path:
 | `unlisted_fallback` | no | `false` | When an explicit `models` chain is configured and it is exhausted, keep going with image-capable models that were not listed. |
 | `free_first` | no | `false` | In auto-discovery, prefer anonymous/built-in free providers (`custom` source) ahead of config-defined ones — reverses the source-tier order. |
 | `timeout_ms` | no | `60000` | Timeout (ms) budget for each individual `create`/`prompt` request inside the vision sub-session |
+| `crop_command` | no | — | Executable used for region cropping (e.g. `/usr/bin/ffmpeg`); when omitted, auto-detected in order `magick` → `convert` → `ffmpeg`. The argument template is inferred from the filename (`ffmpeg` → ffmpeg syntax, otherwise ImageMagick). |
 
 Supported image extensions: png / jpg / jpeg / gif / webp.
 
@@ -105,10 +107,10 @@ Two **user-level shared caches** live side by side under `<cache>/opencode-visio
 
 **Description cache (`descriptions/`)**
 
-- **Key**: `<image-sha>:<effective-question>`, filename `sha256(key)`.
+- **Key**: without `region`, `<image-sha>:<effective-question>` (byte-identical to older versions, so existing entries keep hitting); with `region`, `<image-sha>:r<x1>,<y1>,<x2>,<y2>|<effective-question>` (raw normalized coordinates, isolated from full-image entries). Filename `sha256(key)`.
 - **General full-image parse** (empty / omitted `question`): normalised to the fixed prompt `Describe this image in full detail, including all text, UI elements, diagrams, or content visible.`, so every generic parse collapses onto one entry.
-- **Specific follow-ups**: keep their own `<image-sha>:<question>` keys (format unchanged, existing entries keep hitting).
-- **Write threshold**: generic entries are only written when the description is ≥ 100 chars, so a short refuse/fail answer can't poison the shared full-image entry.
+- **Specific follow-ups**: keep their own `<image-sha>[:region]:<question>` keys (full-image format unchanged, existing entries keep hitting).
+- **Write threshold**: generic entries are only written when the description is ≥ 100 chars (≥ 24 chars when a `region` is present, since a region description can legitimately be short), so a short refuse/fail answer can't poison a shared entry.
 - **Eviction**: LRU by file mtime, capped at 2000 entries / 50 MB; **concurrency** as above.
 
 **Default cache root per platform**
@@ -137,14 +139,19 @@ User pastes image + question
 
 Main model processes:
  ├─ vision-capable: sees the original image directly (zero cost)
- └─ text-only: sees the hint, calls vision_analyze(image_path, question)
+ └─ text-only: sees the hint, calls vision_analyze(image_path, question[, region])
 
 vision_analyze tool:
  ├─ native fast path: session's main model is vision-capable
  │    → return raw image as attachment (no vision model call)
  ├─ http(s) image URL → download (20 MB cap) → same disk path
- ├─ description cache hit (image sha + effective question) → return cached text
- │    (general parses converge on <sha>:<canonical full-detail prompt>;
+ ├─ region given (normalized 0–1000 [x1,y1,x2,y2]):
+ │    → crop that region out of the original **before downscaling** (full resolution)
+ │    → fast path returns the crop; description path sends [crop, original] to the sub-session
+ │    → result carries the crop's pixel bounds + a coordinate-mapping note; coordinates
+ │      always refer to the original image, so crops can be iterated
+ ├─ description cache hit (image sha + region + effective question) → return cached text
+ │    (general parses converge on <sha>[:region]:<canonical full-detail prompt>;
  │     persisted under <cache>/opencode-vision-analyze/descriptions,
  │     tagged with the model that produced it)
  └─ candidate chain: sub-session under current session per candidate, in order —
@@ -154,6 +161,7 @@ vision_analyze tool:
 
 Key behaviors:
 
+- **Region cropping** — `region` is optional; omitting it (or passing the whole-image sentinel `[0,0,1000,1000]`) means the full image, with the old behavior and old cache key unchanged. Cropping shells out to `magick`/`convert`/`ffmpeg` (detected at runtime; `convert` is skipped on win32 to avoid the system tool of the same name); when no engine is found it returns a clear error instead of throwing. The crop runs **before any downscaling**, which is what makes the zoom real. EXIF orientation is honored (auto-orient in the engine + display dimensions from the sniffer).
 - **Capability gating** — queries `config.providers()` capabilities; results cached per process. A vision-capable main model never gets hints or routing.
 - **Candidate chain** — the `models` list is tried in order until one succeeds. Explicit models always head the chain. With no explicit config (or an empty `models` list) the plugin auto-discovers every image-capable model, ordered by provider source (config first, then env/api, then custom/anonymous; reversed with `free_first: true`). With `unlisted_fallback: true`, an exhausted explicit chain continues onto unlisted image-capable models.
 - **Recursion guard (whole chain)** — messages from the candidate chain's own sub-sessions are never re-processed.
@@ -165,7 +173,7 @@ Key behaviors:
 
 ## Roadmap
 
-- [ ] Region cropping for zooming into image details
+- [x] Region cropping for zooming into image details
 
 ## Development
 

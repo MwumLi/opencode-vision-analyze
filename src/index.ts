@@ -27,6 +27,14 @@
  * 主模型本身支持图片输入时走快速路径：不做子会话描述，直接把原图作为
  * 工具附件回传给模型自行查看。
  *
+ * 区域裁剪：vision_analyze 支持可选 region（归一化 0–1000 的 [x1,y1,x2,y2]）。
+ * 主模型先看整图，若某处细节看不清（小字/密集 UI），再带 region 调一次放大。
+ * 插件按 region 从原图裁出子区域（**先裁后降采样**，小块独享完整分辨率预算），
+ * 有 region 时子会话发 [裁剪图, 原图] 两张（原图作全局上下文）。裁剪走**外挂命令**
+ * （magick/convert/ffmpeg，运行时探测、缺失则报可读错误），保持零运行时依赖；
+ * 坐标相对原图、恒可迭代，无 region 行为与缓存 key 完全不变。
+ * 另注册 tool.definition 钩子：框架会把非 zod 参数全标 required，这里改回仅 image_path。
+ *
  * 说明：本插件只用 node 内置模块（crypto/fs/path），无任何运行时外部依赖，
  * 类型依赖仅 @opencode-ai/plugin 与 @opencode-ai/sdk 的 type import。
  *
@@ -253,6 +261,14 @@ export type CropEngine = "magick" | "convert" | "ffmpeg"
 /** 候选引擎顺序：win32 排除 convert（会撞系统 convert.exe）。 */
 export function cropEngineCandidates(platform: string): CropEngine[] {
   return platform === "win32" ? ["magick", "ffmpeg"] : ["magick", "convert", "ffmpeg"]
+}
+
+/** 由可执行文件名（或路径）推断参数模板：含 ffmpeg 用 ffmpeg 语法，否则按 ImageMagick。 */
+export function engineForCommand(cmd: string): CropEngine {
+  const base = path.basename(cmd).toLowerCase()
+  if (base.includes("ffmpeg")) return "ffmpeg"
+  if (base.includes("convert")) return "convert"
+  return "magick"
 }
 
 /** 构造裁剪命令参数（不经 shell；输出恒 PNG）。 */
@@ -502,6 +518,12 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   // 二者按严格布尔取真，非布尔值宽容忽略按 false 处理（与下方 timeout_ms 的宽容校验一致）。
   const fallbackUnlisted = optionsArg?.unlisted_fallback === true
   const freeFirst = optionsArg?.free_first === true
+
+  // crop_command：显式指定裁剪可执行文件（跳过自动探测）。非空字符串才生效；
+  // 参数模板按可执行文件 basename 推断（含 "ffmpeg" 用 ffmpeg 语法，否则按 ImageMagick）。
+  const cropCommandOption = optionsArg?.crop_command
+  const cropCommand =
+    typeof cropCommandOption === "string" && cropCommandOption.trim() ? cropCommandOption.trim() : undefined
 
   // 子会话请求的超时时间：timeout_ms 为正数时生效，默认 60 秒。
   const timeoutOption = optionsArg?.timeout_ms
@@ -786,10 +808,17 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
   }
 
   // ---- 区域裁剪（外挂命令；闭包内探测结果 memoize） ----------------------------
+  /** 解析出的裁剪工具：file 为实际执行的可执行文件，engine 决定参数模板。 */
+  type ResolvedCrop = { file: string; engine: CropEngine }
   /** 裁剪引擎探测结果 memoize（插件实例级，进程内只探一次）。 */
-  let cropEnginePromise: Promise<CropEngine | undefined> | undefined
-  const resolveCropEngine = (): Promise<CropEngine | undefined> => {
-    cropEnginePromise ??= detectCropEngine(process.platform)
+  let cropEnginePromise: Promise<ResolvedCrop | undefined> | undefined
+  const resolveCropEngine = (): Promise<ResolvedCrop | undefined> => {
+    cropEnginePromise ??= (async () => {
+      // 显式 crop_command 优先：跳过探测，模板按文件名推断。
+      if (cropCommand) return { file: cropCommand, engine: engineForCommand(cropCommand) }
+      const engine = await detectCropEngine(process.platform)
+      return engine ? { file: engine, engine } : undefined
+    })()
     return cropEnginePromise
   }
 
@@ -829,7 +858,7 @@ const plugin: Plugin = async (input: PluginInput, optionsArg?: PluginOptions): P
     try {
       tmpDir = await fs.mkdtemp(path.join(tmpdir(), "vision-crop-"))
       const out = path.join(tmpDir, `crop-${randomUUID()}.png`)
-      await cropRunner.exec(engine, buildCropArgs(engine, inputPath, rect, out), ctx.abort)
+      await cropRunner.exec(engine.file, buildCropArgs(engine.engine, inputPath, rect, out), ctx.abort)
       const bytes = await fs.readFile(out)
       if (bytes.length === 0) return { error: "region crop produced an empty image" }
       return { bytes, mime: "image/png" }
