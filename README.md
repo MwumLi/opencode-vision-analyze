@@ -249,7 +249,7 @@ Detection caches **success only**: if the first probe fails, the next trigger pr
 
 If this tool has been helpful to you, feel free to buy me a coffee:
 
-<a href="https://afdian.com/order/create?plan_id=dec0bfdaab3611f1bf595254001e7c00&product_type=0&month=1&remark=%E4%BD%A0%E7%9A%84%E5%B7%A5%E5%85%B7%E6%9C%89%E5%B8%AE%E5%88%B0%E6%88%91%EF%BC%8C%E8%AF%B7%E4%BD%A0%E5%96%9D%E6%9D%AF%E5%92%96%E5%95%A1~&affiliate_code="><img width="200" src="https://pic1.afdiancdn.com/static/img/welcome/button-sponsorme.png" alt="Sponsor me on Afdian"></a>
+<a href="https://afdian.com/order/create?plan_id=dec0bfdaab3611f1bf595254001e7c00&product_type=0&remark=%E4%BD%A0%E7%9A%84%E5%B7%A5%E5%85%B7%E6%9C%89%E5%B8%AE%E5%88%B0%E6%88%91%EF%BC%8C%E8%AF%B7%E4%BD%A0%E5%96%9D%E6%9D%AF%E5%92%96%E5%95%A1~&affiliate_code="><img width="200" src="https://pic1.afdiancdn.com/static/img/welcome/button-sponsorme.png" alt="Sponsor me on Afdian"></a>
 
 ## License
 
