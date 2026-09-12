@@ -224,6 +224,12 @@ npm version patch                      # 去掉 pre 段并升到正式版本
 
 探测结果只缓存"成功"：首次探测失败时下次触发会重新探测（装好工具后无需重启 opencode）；若已缓存成功后又安装了别的工具，需退出并重进 opencode 让首次探测重跑。
 
+## 赞助
+
+如果这个工具有帮到你，欢迎请我喝杯咖啡：
+
+<a href="https://afdian.com/order/create?plan_id=dec0bfdaab3611f1bf595254001e7c00&product_type=0&month=1&remark=%E4%BD%A0%E7%9A%84%E5%B7%A5%E5%85%B7%E6%9C%89%E5%B8%AE%E5%88%B0%E6%88%91%EF%BC%8C%E8%AF%B7%E4%BD%A0%E5%96%9D%E6%9D%AF%E5%92%96%E5%95%A1~&affiliate_code="><img width="200" src="https://pic1.afdiancdn.com/static/img/welcome/button-sponsorme.png" alt="爱发电"></a>
+
 ## 许可证
 
 [MIT](./LICENSE)
