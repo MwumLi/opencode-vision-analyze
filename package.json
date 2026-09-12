@@ -12,6 +12,7 @@
     "dist",
     "README.md",
     "README.zh.md",
+    "docs/INSTALL.md",
     "LICENSE"
   ],
   "scripts": {

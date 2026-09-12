@@ -21,7 +21,24 @@
 
 ## 安装
 
-### 方式 A —— npm（推荐）
+### 方式 1 —— 交给智能体一键安装（粘贴一段提示词）
+
+把下面这段提示词粘贴到任意 OpenCode 会话中：
+
+```
+Install and configure opencode-vision-analyze by following the instructions here:
+https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main/docs/INSTALL.md
+```
+
+智能体会阅读 [`docs/INSTALL.md`](./docs/INSTALL.md)，向你确认安装范围（全局/项目）与首选视觉模型，把插件条目合并进你的 `opencode.json`，并做验证——全程无需手动改配置。
+
+智能体也可直接拉取该指南：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main/docs/INSTALL.md
+```
+
+### 方式 2 —— npm（推荐）
 
 ```jsonc
 // opencode.json（项目级或全局）
@@ -34,7 +51,7 @@
 
 opencode 启动时会自动安装 npm 插件。
 
-### 方式 B —— curl 单文件（免 npm）
+### 方式 3 —— curl 单文件（免 npm）
 
 本插件是零运行时依赖的单文件 TypeScript 源码，直接下载即可使用：
 

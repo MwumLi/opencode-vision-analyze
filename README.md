@@ -21,7 +21,26 @@ A tool-based vision routing plugin for [opencode](https://opencode.ai): when the
 
 ## Installation
 
-### Option A — npm (recommended)
+### Method 1 — Let your agent install it (one paste)
+
+Copy this prompt into any OpenCode session:
+
+```
+Install and configure opencode-vision-analyze by following the instructions here:
+https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main/docs/INSTALL.md
+```
+
+The agent reads [`docs/INSTALL.md`](./docs/INSTALL.md), asks for the install scope and your
+preferred vision model, merges the plugin entry into your `opencode.json`, and verifies it —
+no manual editing.
+
+Agents can fetch the guide directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MwumLi/opencode-vision-analyze/main/docs/INSTALL.md
+```
+
+### Method 2 — npm (recommended)
 
 ```jsonc
 // opencode.json (project or global)
@@ -34,7 +53,7 @@ A tool-based vision routing plugin for [opencode](https://opencode.ai): when the
 
 opencode installs npm plugins automatically at startup.
 
-### Option B — curl single file (no npm)
+### Method 3 — curl single file (no npm)
 
 The plugin is a single self-contained TypeScript file with zero runtime dependencies — you can just download it:
 
