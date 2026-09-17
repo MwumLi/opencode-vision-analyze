@@ -36,3 +36,6 @@ desktop.ini
 # 测试覆盖率
 coverage/
 .nyc_output/
+
+# README 封面原图（大体积源文件，仅本地保留，不入库）
+assets/source/
