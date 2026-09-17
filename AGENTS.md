@@ -38,7 +38,9 @@ npm version patch
 - `npm version` 要求工作区干净：有未提交改动会拒绝执行（先 commit 或 stash）。
 - `postversion` 的 push 若失败（网络/凭据），版本已 bump 但未推送：手动补
   `git push --follow-tags` 即可。
-- 0.x 阶段：新功能用 `npm version minor`（或显式版本号），修 bug 用 `patch`；**不要用 `major`**（会从 0.x 直接跳到 1.0.0）。
+- 0.x 阶段：新功能用 `minor`，修 bug 用 `patch`；**不使用 `major`**——不稳定期不贸然进入
+  1.0.0，确需宣告稳定用显式 `npm version 1.0.0`。
+- 1.0.0 及以后：break change 用 `major`，新功能用 `minor`，修 bug 用 `patch`。
 
 ## 测试
 
