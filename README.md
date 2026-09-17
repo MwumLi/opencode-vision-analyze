@@ -8,7 +8,7 @@
 [![license](https://img.shields.io/npm/l/opencode-vision-analyze)](./LICENSE)
 [![opencode plugin](https://img.shields.io/badge/opencode-plugin-blue)](https://opencode.ai/docs/plugins)
 
-English | [简体中文](./README.zh.md)
+English | [简体中文](./README-zh.md)
 
 A tool-based vision routing plugin for [opencode](https://opencode.ai): when the main model can't see images, it calls the `vision_analyze` tool on demand — your dedicated vision model describes the image and the description flows straight back into the conversation. When the main model already supports images, pasted images pass through untouched and the tool short-circuits to return raw pixels.
 
