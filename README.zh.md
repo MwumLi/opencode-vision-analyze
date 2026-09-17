@@ -1,5 +1,9 @@
 # opencode-vision-analyze
 
+<div align="center">
+  <img src="./images/cover-zh.webp" alt="opencode-vision-analyze — 让 OpenCode 拥有「看图」的能力" width="100%">
+</div>
+
 [![npm](https://img.shields.io/npm/v/opencode-vision-analyze)](https://www.npmjs.com/package/opencode-vision-analyze)
 [![license](https://img.shields.io/npm/l/opencode-vision-analyze)](./LICENSE)
 [![opencode plugin](https://img.shields.io/badge/opencode-plugin-blue)](https://opencode.ai/docs/plugins)
